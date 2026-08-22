@@ -7,6 +7,13 @@ export type ItemStatus =
   | "falhou"
   | "cancelado";
 
+export type SourceKind =
+  | "youtube"
+  | "drive"
+  | "web"
+  | "video_file"
+  | "audio_file";
+
 export interface Preferences {
   yt_dlp_path: string;
   ffmpeg_path: string;
@@ -30,7 +37,7 @@ export interface Diagnostic {
 export interface BatchItem {
   id: string;
   source: string;
-  source_kind: "drive" | "video_file" | "audio_file";
+  source_kind: SourceKind;
   local_path?: string;
   title?: string;
   status: ItemStatus;
@@ -46,3 +53,4 @@ export interface Batch {
   running: boolean;
   cancelled: boolean;
 }
+

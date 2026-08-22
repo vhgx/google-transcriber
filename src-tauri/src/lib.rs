@@ -42,34 +42,34 @@ pub struct Check { name: String, path: String, available: bool, message: String 
 #[derive(Clone, Debug, Serialize)]
 pub struct Diagnostic { checks: Vec<Check> }
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ItemStatus { Aguardando, Baixando, Convertendo, Transcrevendo, Concluido, Falhou, Cancelado }
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
-pub enum SourceKind { Drive, VideoFile, AudioFile }
+pub enum SourceKind { Youtube, Drive, Web, VideoFile, AudioFile }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BatchItem {
-    id: String,
-    source: String,
-    source_kind: SourceKind,
-    local_path: Option<String>,
-    title: Option<String>,
-    status: ItemStatus,
-    output_dir: String,
-    error: Option<String>,
-    log: Vec<String>,
+    pub id: String,
+    pub source: String,
+    pub source_kind: SourceKind,
+    pub local_path: Option<String>,
+    pub title: Option<String>,
+    pub status: ItemStatus,
+    pub output_dir: String,
+    pub error: Option<String>,
+    pub log: Vec<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Batch {
-    id: String,
-    output_dir: String,
-    items: Vec<BatchItem>,
-    running: bool,
-    cancelled: bool,
+    pub id: String,
+    pub output_dir: String,
+    pub items: Vec<BatchItem>,
+    pub running: bool,
+    pub cancelled: bool,
 }
 
 pub struct AppState {
@@ -97,19 +97,32 @@ fn persist_preferences(path: &Path, preferences: &Preferences) -> Result<(), Str
     fs::write(path, json).map_err(|e| format!("Não foi possível salvar as configurações: {e}"))
 }
 
-fn valid_drive_url(raw: &str) -> Result<String, String> {
+pub fn parse_web_url(raw: &str) -> Result<(String, SourceKind), String> {
     let raw = raw.trim();
     let url = Url::parse(raw).map_err(|_| format!("URL inválida: {raw}"))?;
-    if url.scheme() != "https" { return Err(format!("A URL deve usar HTTPS: {raw}")); }
-    if url.host_str() != Some("drive.google.com") { return Err(format!("A URL não é um arquivo do Google Drive: {raw}")); }
-    if url.path().contains("/folders/") { return Err(format!("Links de pasta não são aceitos nesta versão: {raw}")); }
-    if !url.path().contains("/file/") && !url.path().contains("/uc") && !url.path().contains("/open") {
-        return Err(format!("Use um link de arquivo compartilhado do Google Drive: {raw}"));
+    if url.scheme() != "https" && url.scheme() != "http" {
+        return Err(format!("A URL deve usar HTTP ou HTTPS: {raw}"));
     }
-    Ok(url.into())
+    let host = url.host_str().unwrap_or("").to_lowercase();
+    if host.is_empty() {
+        return Err(format!("Host não encontrado na URL: {raw}"));
+    }
+    if host.contains("youtube.com") || host.contains("youtu.be") {
+        Ok((url.to_string(), SourceKind::Youtube))
+    } else if host.contains("drive.google.com") {
+        if url.path().contains("/folders/") {
+            return Err(format!("Links de pastas do Google Drive não são aceitos nesta versão: {raw}"));
+        }
+        if !url.path().contains("/file/") && !url.path().contains("/uc") && !url.path().contains("/open") {
+            return Err(format!("Use um link de arquivo compartilhado do Google Drive: {raw}"));
+        }
+        Ok((url.to_string(), SourceKind::Drive))
+    } else {
+        Ok((url.to_string(), SourceKind::Web))
+    }
 }
 
-fn local_source(raw: &str) -> Result<(PathBuf, SourceKind), String> {
+pub fn local_source(raw: &str) -> Result<(PathBuf, SourceKind), String> {
     let path = fs::canonicalize(raw.trim()).map_err(|_| format!("Arquivo local não encontrado: {raw}"))?;
     if !path.is_file() { return Err(format!("O caminho não é um arquivo: {}", path.display())); }
     let extension = path.extension().and_then(|value| value.to_str()).unwrap_or("").to_ascii_lowercase();
@@ -135,6 +148,26 @@ where F: FnOnce(&mut BatchItem) {
         }
     }
     emit_batch(app);
+}
+
+fn find_downloaded_media(dir: &Path) -> Option<PathBuf> {
+    let video_mp4 = dir.join("video.mp4");
+    if video_mp4.is_file() {
+        return Some(video_mp4);
+    }
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.starts_with("video.") && !name.ends_with(".part") && !name.ends_with(".ytdl") {
+                        return Some(path);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 #[tauri::command]
@@ -171,8 +204,8 @@ fn create_batch(urls: Vec<String>, files: Vec<String>, state: State<'_, AppState
     let mut sources: Vec<(String, SourceKind, Option<String>, Option<String>)> = Vec::new();
     for raw in urls {
         if raw.trim().is_empty() { continue; }
-        let url = valid_drive_url(&raw)?;
-        if seen.insert(url.clone()) { sources.push((url, SourceKind::Drive, None, None)); }
+        let (url, kind) = parse_web_url(&raw)?;
+        if seen.insert(url.clone()) { sources.push((url, kind, None, None)); }
     }
     for raw in files {
         let (path, kind) = local_source(&raw)?;
@@ -182,7 +215,7 @@ fn create_batch(urls: Vec<String>, files: Vec<String>, state: State<'_, AppState
             sources.push((key.clone(), kind, Some(key), Some(title)));
         }
     }
-    if sources.is_empty() { return Err("Cole uma URL do Drive ou selecione pelo menos um arquivo local.".into()); }
+    if sources.is_empty() { return Err("Cole uma URL (YouTube, Drive ou Web) ou selecione pelo menos um arquivo local.".into()); }
     let preferences = lock(&state.preferences)?.clone();
     let output_dir = PathBuf::from(preferences.output_dir).join(Local::now().format("%Y-%m-%d_%H-%M-%S").to_string());
     fs::create_dir_all(&output_dir).map_err(|e| format!("Não foi possível criar a pasta do lote: {e}"))?;
@@ -235,6 +268,34 @@ fn cancel_batch(app: AppHandle, state: State<'_, AppState>) -> Result<(), String
     Ok(())
 }
 
+#[tauri::command]
+fn read_transcript(output_dir: String) -> Result<String, String> {
+    let dir = PathBuf::from(output_dir);
+    let transcript_path = dir.join("transcricao.txt");
+    if !transcript_path.is_file() {
+        return Err("O arquivo de transcrição (transcricao.txt) não foi encontrado.".into());
+    }
+    fs::read_to_string(&transcript_path).map_err(|e| format!("Não foi possível ler a transcrição: {e}"))
+}
+
+#[tauri::command]
+fn open_in_finder(path: String) -> Result<(), String> {
+    let target = PathBuf::from(&path);
+    if !target.exists() {
+        return Err(format!("O caminho não existe: {path}"));
+    }
+    let status = if target.is_dir() {
+        std::process::Command::new("open").arg(&target).status()
+    } else {
+        std::process::Command::new("open").args(["-R", target.to_string_lossy().as_ref()]).status()
+    };
+    match status {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => Err(format!("Falha ao abrir no Finder (código {:?})", s.code())),
+        Err(e) => Err(format!("Erro ao executar open: {e}")),
+    }
+}
+
 async fn process_batch(app: AppHandle, concurrency: u8) {
     let mut workers = Vec::new();
     for _ in 0..concurrency {
@@ -258,7 +319,12 @@ async fn worker(app: AppHandle) {
             let Some(batch) = batch.as_mut() else { return };
             let Some(index) = batch.items.iter().position(|item| item.status == ItemStatus::Aguardando) else { return };
             batch.items[index].status = ItemStatus::Baixando;
-            let message = if batch.items[index].source_kind == SourceKind::Drive { "Validando link compartilhado…" } else { "Preparando arquivo local…" };
+            let message = match batch.items[index].source_kind {
+                SourceKind::Youtube => "Buscando informações do YouTube…",
+                SourceKind::Drive => "Validando link do Google Drive…",
+                SourceKind::Web => "Buscando informações do link Web…",
+                SourceKind::VideoFile | SourceKind::AudioFile => "Preparando arquivo local…",
+            };
             batch.items[index].log.push(message.into());
             index
         };
@@ -277,20 +343,45 @@ async fn process_item(app: &AppHandle, index: usize) {
     if let Err(error) = fs::create_dir_all(&item_dir) { fail_item(app, index, format!("Não foi possível criar a pasta do vídeo: {error}")); return; }
 
     let media_file = match source_kind {
-        SourceKind::Drive => {
-            let probe = run_tool(app, &preferences.yt_dlp_path, &["--no-download", "--no-playlist", "--dump-single-json", &source], &item_dir).await;
-            let metadata = match probe { Ok(output) => output, Err(error) => { finish_error(app, index, error); return; } };
-            if let Ok(json) = serde_json::from_str::<Value>(&metadata) {
-                if let Some(title) = json.get("title").and_then(Value::as_str) { update_item(app, index, |item| item.title = Some(title.into())); }
+        SourceKind::Youtube | SourceKind::Drive | SourceKind::Web => {
+            let mut probe_args = vec!["--no-download", "--no-playlist", "--no-update", "--dump-single-json"];
+            if source_kind == SourceKind::Youtube {
+                probe_args.extend(["--extractor-args", "youtube:player_client=ios,android,web,mweb"]);
+            }
+            probe_args.push(&source);
+            let probe = run_tool(app, &preferences.yt_dlp_path, &probe_args, &item_dir).await;
+            if let Ok(metadata) = probe {
+                if let Ok(json) = serde_json::from_str::<Value>(&metadata) {
+                    if let Some(title) = json.get("title").and_then(Value::as_str) {
+                        update_item(app, index, |item| item.title = Some(title.into()));
+                    }
+                }
             }
             if is_cancelled(app) { return; }
-            update_item(app, index, |item| { item.status = ItemStatus::Baixando; item.log.push("Baixando e unindo vídeo em MP4…".into()); });
+            update_item(app, index, |item| { item.status = ItemStatus::Baixando; item.log.push("Baixando mídia via yt-dlp…".into()); });
             let video_template = item_dir.join("video.%(ext)s").to_string_lossy().to_string();
-            let download_args = ["--no-playlist", "--no-progress", "--ffmpeg-location", &preferences.ffmpeg_path, "--format", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best", "--merge-output-format", "mp4", "--recode-video", "mp4", "--output", &video_template, &source];
+            let mut download_args = vec![
+                "--no-playlist",
+                "--no-progress",
+                "--no-update",
+                "--ffmpeg-location", &preferences.ffmpeg_path,
+                "--format", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/bestvideo+bestaudio/best",
+                "--merge-output-format", "mp4",
+                "--recode-video", "mp4",
+                "--output", &video_template,
+            ];
+            if source_kind == SourceKind::Youtube {
+                download_args.extend(["--extractor-args", "youtube:player_client=ios,android,web,mweb"]);
+            }
+            download_args.push(&source);
             if let Err(error) = run_tool(app, &preferences.yt_dlp_path, &download_args, &item_dir).await { finish_error(app, index, error); return; }
-            let video = item_dir.join("video.mp4");
-            if !video.is_file() { finish_error(app, index, "O yt-dlp baixou faixas separadas, mas não conseguiu uni-las em video.mp4. Verifique o caminho do ffmpeg em Configurações.".into()); return; }
-            video
+            match find_downloaded_media(&item_dir) {
+                Some(file) => file,
+                None => {
+                    finish_error(app, index, "O download terminou, mas o arquivo de mídia não foi encontrado. Verifique o caminho do ffmpeg em Configurações.".into());
+                    return;
+                }
+            }
         }
         SourceKind::VideoFile | SourceKind::AudioFile => {
             let original = match local_path { Some(path) => PathBuf::from(path), None => { fail_item(app, index, "O caminho do arquivo local está ausente.".into()); return; } };
@@ -317,7 +408,7 @@ async fn process_item(app: &AppHandle, index: usize) {
     let model = preferences.model_path.clone(); let audio = audio.to_string_lossy().to_string();
     if let Err(error) = run_tool(app, &preferences.whisper_path, &["-m", &model, "-f", &audio, "-l", "pt", "-otxt", "-of", "transcricao"], &item_dir).await { finish_error(app, index, error); return; }
     if !item_dir.join("transcricao.txt").is_file() { finish_error(app, index, "A transcrição terminou, mas não gerou transcricao.txt.".into()); return; }
-    update_item(app, index, |item| { item.status = ItemStatus::Concluido; item.log.push("Concluído: arquivo original, audio.mp3 e transcricao.txt".into()); });
+    update_item(app, index, |item| { item.status = ItemStatus::Concluido; item.log.push("Concluído: áudio e transcrição prontos".into()); });
 }
 
 fn is_cancelled(app: &AppHandle) -> bool { app.state::<AppState>().cancelled.load(Ordering::SeqCst) }
@@ -350,7 +441,17 @@ pub fn run() {
             app.manage(AppState { preferences: Mutex::new(preferences), batch: Mutex::new(None), cancelled: AtomicBool::new(false), running_pids: Mutex::new(HashSet::new()), config_path });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_preferences, update_preferences, diagnose, create_batch, get_batch, start_batch, cancel_batch])
+        .invoke_handler(tauri::generate_handler![
+            get_preferences,
+            update_preferences,
+            diagnose,
+            create_batch,
+            get_batch,
+            start_batch,
+            cancel_batch,
+            read_transcript,
+            open_in_finder
+        ])
         .run(tauri::generate_context!())
         .expect("erro ao executar aplicativo Tauri");
 }
@@ -360,16 +461,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn accepts_supported_google_drive_file_links() {
-        assert!(valid_drive_url("https://drive.google.com/file/d/abc123/view?usp=sharing").is_ok());
-        assert!(valid_drive_url("https://drive.google.com/open?id=abc123").is_ok());
+    fn parses_youtube_urls_correctly() {
+        let (url, kind) = parse_web_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ").unwrap();
+        assert_eq!(kind, SourceKind::Youtube);
+        assert!(url.contains("youtube.com"));
+
+        let (_, kind2) = parse_web_url("https://youtu.be/dQw4w9WgXcQ").unwrap();
+        assert_eq!(kind2, SourceKind::Youtube);
     }
 
     #[test]
-    fn rejects_non_file_or_non_drive_links() {
-        assert!(valid_drive_url("http://drive.google.com/file/d/abc/view").is_err());
-        assert!(valid_drive_url("https://drive.google.com/drive/folders/abc").is_err());
-        assert!(valid_drive_url("https://example.com/file/d/abc/view").is_err());
+    fn parses_google_drive_urls_correctly() {
+        let (_, kind) = parse_web_url("https://drive.google.com/file/d/abc123/view?usp=sharing").unwrap();
+        assert_eq!(kind, SourceKind::Drive);
+
+        let (_, kind2) = parse_web_url("https://drive.google.com/open?id=abc123").unwrap();
+        assert_eq!(kind2, SourceKind::Drive);
+    }
+
+    #[test]
+    fn parses_generic_web_urls() {
+        let (_, kind) = parse_web_url("https://vimeo.com/76979871").unwrap();
+        assert_eq!(kind, SourceKind::Web);
+    }
+
+    #[test]
+    fn rejects_invalid_schemes_and_drive_folders() {
+        assert!(parse_web_url("ftp://example.com/video.mp4").is_err());
+        assert!(parse_web_url("https://drive.google.com/drive/folders/abc").is_err());
+        assert!(parse_web_url("not-a-url").is_err());
     }
 
     #[test]
@@ -389,3 +509,4 @@ mod tests {
         assert!(local_source("/tmp/yt-txt-unsupported.pdf").is_err());
     }
 }
+
