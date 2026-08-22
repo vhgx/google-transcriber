@@ -11,10 +11,14 @@ Cada lote cria uma pasta em `~/Downloads/Transcrições/<data-hora>/`, contendo 
   - Arquivos compartilhados do Google Drive.
   - Links de vídeo/áudio da Web suportados pelo `yt-dlp` (Vimeo, TikTok, etc.).
   - Arquivos locais no Mac: MP4, MOV, M4V, MKV, WebM, AVI, MP3, M4A, WAV, AAC, OGG, FLAC, AIFF e OPUS.
-- **Processamento 100% Local**: Áudio e transcrição gerados no próprio computador sem envio para nuvem.
-- **Visualizador Integrado**: Leia as transcrições diretamente no app, consulte estatísticas de palavras/caracteres e copie o texto em 1 clique.
+- **Gerenciador de Modelos In-App**: Baixe e alterne com 1 clique modelos GGML oficiais do Hugging Face (`tiny`, `base`, `small`, `medium`, `large-v3-turbo`, `large-v3`) com progresso em tempo real e métricas de RAM/velocidade.
+- **Múltiplos Formatos de Exportação**: Geração simultânea de `.txt` (texto plano), `.srt` (legendas com timestamps), `.vtt` (WebVTT), `.json` e `.md` (Markdown formatado).
+- **Progresso Granular em Tempo Real**: Barra de progresso animada com percentual contínuo do download via `yt-dlp` e da transcrição via `whisper.cpp`.
+- **Histórico Persistente com Busca**: Armazenamento local de todas as transcrições, contador de palavras e barra de pesquisa instantânea para localizar trechos transcritos.
+- **Visualizador Multi-Formato**: Leia, alterne entre abas de formatos, consulte estatísticas de palavras/caracteres e copie o texto ou legenda em 1 clique.
+- **Processamento 100% Local**: Áudio e transcrições gerados no próprio computador sem envio para nuvem.
 - **Integração com o Finder**: Botão direto para abrir a pasta de saída do lote ou do item.
-- **Configurações Nativas**: Seletores de arquivo e pasta nativos do macOS para configurar `yt-dlp`, `ffmpeg`, `whisper-cli`, modelos GGML e pasta de saída.
+- **Configurações Nativas**: Seletores de arquivo e pasta nativos do macOS para configurar dependências.
 
 ## Pré-requisitos de processamento
 
