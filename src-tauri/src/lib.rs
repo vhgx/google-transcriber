@@ -871,6 +871,107 @@ fn read_transcript_bundle(output_dir: String) -> Result<TranscriptBundle, String
 }
 
 #[tauri::command]
+fn read_audio_bytes(output_dir: String) -> Result<Vec<u8>, String> {
+    let dir = PathBuf::from(&output_dir);
+    let audio_path = dir.join("audio.mp3");
+    if audio_path.is_file() {
+        return fs::read(&audio_path)
+            .map_err(|e| format!("Não foi possível ler audio.mp3: {e}"));
+    }
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
+                let lower = ext.to_ascii_lowercase();
+                if matches!(lower.as_str(), "mp3" | "m4a" | "wav" | "aac" | "ogg" | "flac" | "opus") {
+                    return fs::read(&p).map_err(|e| format!("Não foi possível ler áudio: {e}"));
+                }
+            }
+        }
+    }
+    Err("Arquivo de áudio não encontrado na pasta de saída.".into())
+}
+
+#[tauri::command]
+fn save_transcript_edits(
+    output_dir: String,
+    txt: String,
+    srt: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let dir = PathBuf::from(&output_dir);
+    if !dir.is_dir() {
+        return Err(format!("Pasta de saída não encontrada: {output_dir}"));
+    }
+
+    let txt_path = dir.join("transcricao.txt");
+    fs::write(&txt_path, &txt)
+        .map_err(|e| format!("Erro ao salvar transcricao.txt: {e}"))?;
+
+    if let Some(ref srt_content) = srt {
+        let srt_path = dir.join("transcricao.srt");
+        let _ = fs::write(&srt_path, srt_content);
+    }
+
+    let word_count = txt.trim().split_whitespace().count();
+    let char_count = txt.chars().count();
+    let preview_text: String = txt.chars().take(220).collect();
+
+    let mut history = load_history(&state.history_path);
+    let mut title = "Transcrição".to_string();
+    let mut source = "".to_string();
+    let mut model_name = "ggml-medium.bin".to_string();
+
+    if let Some(entry) = history.iter_mut().find(|h| h.output_dir == output_dir) {
+        entry.word_count = word_count;
+        entry.char_count = char_count;
+        entry.preview_text = preview_text.clone();
+        title = entry.title.clone();
+        source = entry.source.clone();
+        model_name = entry.model_name.clone();
+    }
+    let _ = persist_history(&state.history_path, &history);
+
+    let md_content = generate_markdown_transcript(
+        &title,
+        &source,
+        &model_name,
+        &txt,
+        srt.as_deref(),
+    );
+    let _ = fs::write(dir.join("transcricao.md"), md_content);
+
+    Ok(())
+}
+
+#[tauri::command]
+fn save_recorded_audio(
+    bytes: Vec<u8>,
+    filename: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    if bytes.is_empty() {
+        return Err("Áudio gravado está vazio.".into());
+    }
+    let preferences = lock(&state.preferences)?.clone();
+    let recordings_dir = PathBuf::from(preferences.output_dir).join("Gravações");
+    fs::create_dir_all(&recordings_dir)
+        .map_err(|e| format!("Não foi possível criar a pasta de gravações: {e}"))?;
+
+    let safe_name = if filename.trim().is_empty() {
+        format!("gravacao_{}.wav", Local::now().format("%Y-%m-%d_%H-%M-%S"))
+    } else {
+        filename
+    };
+
+    let target = recordings_dir.join(safe_name);
+    fs::write(&target, bytes)
+        .map_err(|e| format!("Erro ao gravar áudio do microfone: {e}"))?;
+
+    Ok(target.to_string_lossy().to_string())
+}
+
+#[tauri::command]
 fn get_history(state: State<'_, AppState>) -> Result<Vec<HistoryEntry>, String> {
     Ok(load_history(&state.history_path))
 }
@@ -1508,6 +1609,9 @@ pub fn run() {
             cancel_batch,
             read_transcript,
             read_transcript_bundle,
+            read_audio_bytes,
+            save_transcript_edits,
+            save_recorded_audio,
             get_history,
             delete_history_item,
             clear_history,
@@ -1588,5 +1692,19 @@ mod tests {
         assert_eq!(kind, SourceKind::AudioFile);
         fs::remove_file(&media).unwrap();
         assert!(local_source("/tmp/yt-txt-unsupported.pdf").is_err());
+    }
+
+    #[test]
+    fn generates_markdown_transcript_correctly() {
+        let md = generate_markdown_transcript(
+            "Vídeo de Teste",
+            "https://youtu.be/test",
+            "ggml-medium.bin",
+            "Olá mundo, este é um teste.",
+            Some("1\n00:00:00,000 --> 00:00:02,000\nOlá mundo"),
+        );
+        assert!(md.contains("# Transcrição: Vídeo de Teste"));
+        assert!(md.contains("Olá mundo, este é um teste."));
+        assert!(md.contains("## ⏱️ Linha do Tempo (Timestamps)"));
     }
 }

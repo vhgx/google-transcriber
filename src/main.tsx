@@ -1,8 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, DragEvent } from "react";
 import { createRoot } from "react-dom/client";
+import { AudioPlayerSync } from "./components/AudioPlayerSync";
+import { AudioRecorderModal } from "./components/AudioRecorderModal";
 import type {
   Batch,
   BatchItem,
@@ -13,8 +15,10 @@ import type {
   SourceKind,
   TranscriptBundle,
   TranscriptFormat,
+  TranscriptSegment,
   WhisperModelInfo,
 } from "./types";
+import { parseSrtSegments, segmentsToSrt } from "./utils/srtParser";
 import "./styles.css";
 
 const statusLabel: Record<string, string> = {
@@ -35,6 +39,11 @@ const sourceBadgeConfig: Record<SourceKind, { label: string; className: string }
   audio_file: { label: "Áudio local", className: "badge-audio" },
 };
 
+const SUPPORTED_EXTENSIONS = [
+  "mp4", "mov", "m4v", "mkv", "webm", "avi",
+  "mp3", "m4a", "wav", "aac", "ogg", "flac", "aiff", "opus",
+];
+
 interface ViewerTarget {
   title: string;
   source: string;
@@ -45,8 +54,13 @@ interface ViewerTarget {
 interface ViewerState {
   target: ViewerTarget;
   bundle: TranscriptBundle | null;
+  segments: TranscriptSegment[];
   selectedFormat: TranscriptFormat;
+  isEditing: boolean;
+  editedTxt: string;
   loading: boolean;
+  savingEdits: boolean;
+  saveSuccess: boolean;
   error?: string;
 }
 
@@ -63,6 +77,9 @@ function App() {
   const [historySearch, setHistorySearch] = useState("");
 
   const [showSettings, setShowSettings] = useState(false);
+  const [showRecorder, setShowRecorder] = useState(false);
+  const [isDraggingOver, setIsDraggingOver] = useState(false);
+
   const [message, setMessage] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [viewing, setViewing] = useState<ViewerState | null>(null);
@@ -170,10 +187,7 @@ function App() {
         filters: [
           {
             name: "Vídeo e áudio",
-            extensions: [
-              "mp4", "mov", "m4v", "mkv", "webm", "avi",
-              "mp3", "m4a", "wav", "aac", "ogg", "flac", "aiff", "opus",
-            ],
+            extensions: SUPPORTED_EXTENSIONS,
           },
         ],
       });
@@ -184,6 +198,51 @@ function App() {
       setMessage(String(error));
     }
   }
+
+  // Drag & Drop Handlers
+  const handleDragOver = (e: DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDraggingOver(true);
+  };
+
+  const handleDragLeave = (e: DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDraggingOver(false);
+  };
+
+  const handleDrop = (e: DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDraggingOver(false);
+
+    // Verificar se foram soltos arquivos
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      const droppedPaths: string[] = [];
+      for (let i = 0; i < e.dataTransfer.files.length; i++) {
+        const file = e.dataTransfer.files[i];
+        // Em apps Tauri, file pode conter path
+        const path = (file as unknown as { path?: string }).path || file.name;
+        const ext = path.split(".").pop()?.toLowerCase();
+        if (ext && SUPPORTED_EXTENSIONS.includes(ext)) {
+          droppedPaths.push(path);
+        }
+      }
+      if (droppedPaths.length > 0) {
+        setFiles((current) => [...new Set([...current, ...droppedPaths])]);
+        setActiveTab("composer");
+        return;
+      }
+    }
+
+    // Verificar se foi solto texto/URL
+    const textData = e.dataTransfer.getData("text");
+    if (textData && textData.trim()) {
+      setUrls((curr) => (curr ? `${curr}\n${textData.trim()}` : textData.trim()));
+      setActiveTab("composer");
+    }
+  };
 
   async function cancel() {
     try {
@@ -252,28 +311,96 @@ function App() {
     setViewing({
       target,
       bundle: null,
-      selectedFormat: "txt",
+      segments: [],
+      selectedFormat: "sync",
+      isEditing: false,
+      editedTxt: "",
       loading: true,
+      savingEdits: false,
+      saveSuccess: false,
     });
     setViewerCopied(false);
     try {
       const bundle = await invoke<TranscriptBundle>("read_transcript_bundle", {
         outputDir: target.output_dir,
       });
+      const parsedSegments = bundle.srt ? parseSrtSegments(bundle.srt) : [];
       setViewing({
         target,
         bundle,
-        selectedFormat: "txt",
+        segments: parsedSegments,
+        selectedFormat: parsedSegments.length > 0 ? "sync" : "txt",
+        isEditing: false,
+        editedTxt: bundle.txt,
         loading: false,
+        savingEdits: false,
+        saveSuccess: false,
       });
     } catch (error) {
       setViewing({
         target,
         bundle: null,
+        segments: [],
         selectedFormat: "txt",
+        isEditing: false,
+        editedTxt: "",
         loading: false,
+        savingEdits: false,
+        saveSuccess: false,
         error: String(error),
       });
+    }
+  }
+
+  async function saveEdits() {
+    if (!viewing) return;
+    setViewing((v) => (v ? { ...v, savingEdits: true, saveSuccess: false } : v));
+
+    try {
+      let finalTxt = viewing.editedTxt;
+      let finalSrt: string | undefined = undefined;
+
+      if (viewing.selectedFormat === "sync" && viewing.segments.length > 0) {
+        finalSrt = segmentsToSrt(viewing.segments);
+        finalTxt = viewing.segments.map((s) => s.text).join("\n\n");
+      }
+
+      await invoke("save_transcript_edits", {
+        outputDir: viewing.target.output_dir,
+        txt: finalTxt,
+        srt: finalSrt,
+      });
+
+      // Recarregar bundle atualizado
+      const updatedBundle = await invoke<TranscriptBundle>("read_transcript_bundle", {
+        outputDir: viewing.target.output_dir,
+      });
+      const updatedSegments = updatedBundle.srt ? parseSrtSegments(updatedBundle.srt) : viewing.segments;
+
+      setViewing((v) =>
+        v
+          ? {
+              ...v,
+              bundle: updatedBundle,
+              segments: updatedSegments,
+              editedTxt: updatedBundle.txt,
+              isEditing: false,
+              savingEdits: false,
+              saveSuccess: true,
+            }
+          : v
+      );
+
+      // Atualizar lista de histórico
+      const updatedHistory = await invoke<HistoryEntry[]>("get_history");
+      setHistory(updatedHistory);
+
+      setTimeout(() => {
+        setViewing((v) => (v ? { ...v, saveSuccess: false } : v));
+      }, 3000);
+    } catch (err) {
+      setMessage(`Erro ao salvar edições: ${err}`);
+      setViewing((v) => (v ? { ...v, savingEdits: false } : v));
     }
   }
 
@@ -352,7 +479,7 @@ function App() {
   async function copyViewerCurrentText() {
     if (!viewing?.bundle) return;
     const content =
-      viewing.selectedFormat === "txt"
+      viewing.selectedFormat === "sync" || viewing.selectedFormat === "txt"
         ? viewing.bundle.txt
         : viewing.selectedFormat === "srt"
         ? viewing.bundle.srt || viewing.bundle.txt
@@ -389,684 +516,785 @@ function App() {
   }, [viewing]);
 
   return (
-    <main>
-      <header>
-        <div>
-          <p className="eyebrow">PROCESSAMENTO 100% LOCAL · PORTUGUÊS</p>
-          <h1>Transcrições</h1>
+    <div
+      className={`app-container ${isDraggingOver ? "dragging-over" : ""}`}
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+    >
+      {/* Overlay Visual de Drag & Drop */}
+      {isDraggingOver && (
+        <div className="drag-drop-overlay">
+          <div className="drag-drop-box">
+            <span className="drag-icon">📥</span>
+            <h2>Solte seus vídeos ou áudios aqui</h2>
+            <p>Os arquivos serão adicionados à fila de transcrição instantaneamente.</p>
+          </div>
         </div>
-        <div className="header-actions">
-          <div className="tab-nav">
-            <button
-              className={`tab-button ${activeTab === "composer" ? "active" : ""}`}
-              onClick={() => setActiveTab("composer")}
-            >
-              ⚡ Nova Transcrição
+      )}
+
+      <main>
+        <header>
+          <div>
+            <p className="eyebrow">PROCESSAMENTO 100% LOCAL · PORTUGUÊS</p>
+            <h1>Transcrições</h1>
+          </div>
+          <div className="header-actions">
+            <div className="tab-nav">
+              <button
+                className={`tab-button ${activeTab === "composer" ? "active" : ""}`}
+                onClick={() => setActiveTab("composer")}
+              >
+                ⚡ Nova Transcrição
+              </button>
+              <button
+                className={`tab-button ${activeTab === "history" ? "active" : ""}`}
+                onClick={() => setActiveTab("history")}
+              >
+                📚 Histórico {history.length > 0 && <span className="tab-count">{history.length}</span>}
+              </button>
+            </div>
+            <button className="secondary" onClick={() => setShowRecorder(true)} title="Gravar áudio do microfone">
+              🎙️ Gravar
             </button>
-            <button
-              className={`tab-button ${activeTab === "history" ? "active" : ""}`}
-              onClick={() => setActiveTab("history")}
-            >
-              📚 Histórico {history.length > 0 && <span className="tab-count">{history.length}</span>}
+            <button className="secondary" onClick={() => setShowSettings(true)}>
+              ⚙ Configurações
             </button>
           </div>
-          <button className="secondary" onClick={() => setShowSettings(true)}>
-            ⚙ Configurações
-          </button>
-        </div>
-      </header>
+        </header>
 
-      {message && (
-        <div className="notice error">
-          <span>{message}</span>
-          <button onClick={() => setMessage(null)}>×</button>
-        </div>
-      )}
+        {message && (
+          <div className="notice error">
+            <span>{message}</span>
+            <button onClick={() => setMessage(null)}>×</button>
+          </div>
+        )}
 
-      {!dependenciesReady && (
-        <div className="notice warning">
-          <span>⚠️ Alguma dependência local não foi encontrada. Ajuste os caminhos nas Configurações antes de iniciar.</span>
-          <button className="small-button" onClick={() => setShowSettings(true)}>
-            Ajustar
-          </button>
-        </div>
-      )}
+        {!dependenciesReady && (
+          <div className="notice warning">
+            <span>⚠️ Alguma dependência local não foi encontrada. Ajuste os caminhos nas Configurações antes de iniciar.</span>
+            <button className="small-button" onClick={() => setShowSettings(true)}>
+              Ajustar
+            </button>
+          </div>
+        )}
 
-      {/* ABA: COMPOSER / FILA ATIVA */}
-      {activeTab === "composer" && (
-        <>
-          <section className="composer card">
-            <label htmlFor="urls">Links de vídeos (YouTube, Google Drive ou Web)</label>
-            <textarea
-              id="urls"
-              value={urls}
-              onChange={(event) => setUrls(event.target.value)}
-              placeholder={`https://www.youtube.com/watch?v=...\nhttps://youtu.be/...\nhttps://drive.google.com/file/d/.../view\nhttps://vimeo.com/...`}
-              disabled={batch?.running}
-            />
+        {/* ABA: COMPOSER / FILA ATIVA */}
+        {activeTab === "composer" && (
+          <>
+            <section className="composer card">
+              <label htmlFor="urls">Links de vídeos (YouTube, Google Drive ou Web)</label>
+              <textarea
+                id="urls"
+                value={urls}
+                onChange={(event) => setUrls(event.target.value)}
+                placeholder={`https://www.youtube.com/watch?v=...\nhttps://youtu.be/...\nhttps://drive.google.com/file/d/.../view\nhttps://vimeo.com/...`}
+                disabled={batch?.running}
+              />
 
-            <div className="file-picker">
-              <div>
-                <strong>ou selecione arquivos deste Mac</strong>
-                <p>Vídeo ou áudio — processamento 100% no seu computador com whisper.cpp.</p>
-              </div>
-              <button className="secondary" onClick={selectFiles} disabled={batch?.running}>
-                Selecionar arquivos
-              </button>
-            </div>
-
-            {files.length > 0 && (
-              <div className="selected-files">
-                {files.map((file) => (
-                  <span key={file}>
-                    <b>{file.split("/").pop()}</b>
-                    <button
-                      aria-label={`Remover ${file}`}
-                      onClick={() => setFiles((current) => current.filter((item) => item !== file))}
-                      disabled={batch?.running}
-                    >
-                      ×
-                    </button>
-                  </span>
-                ))}
-              </div>
-            )}
-
-            <div className="composer-footer">
-              <span>
-                {cleanCount} {cleanCount === 1 ? "mídia única" : "mídias únicas"} selecionada{cleanCount === 1 ? "" : "s"}
-              </span>
-              <button onClick={start} disabled={!cleanCount || !dependenciesReady || Boolean(batch?.running)}>
-                {batch?.running ? "Processando lote..." : "Iniciar transcrição"}
-              </button>
-            </div>
-          </section>
-
-          {batch && (
-            <section className="card queue">
-              <div className="section-title">
+              <div className="file-picker">
                 <div>
-                  <p className="eyebrow">LOTE ATUAL</p>
-                  <h2>{batch.running ? "Em processamento" : batch.cancelled ? "Lote cancelado" : "Lote finalizado"}</h2>
-                  <p className="path" title={batch.output_dir}>
-                    📁 {batch.output_dir}
-                  </p>
+                  <strong>ou selecione / arraste arquivos deste Mac</strong>
+                  <p>Vídeo ou áudio (MP4, MOV, MKV, MP3, M4A, WAV, etc.) — arrraste e solte direto aqui.</p>
                 </div>
-                <div className="queue-actions">
-                  <button className="secondary small-button" onClick={() => openInFinder(batch.output_dir)}>
-                    Abrir pasta do lote
+                <div className="picker-buttons">
+                  <button
+                    type="button"
+                    className="secondary"
+                    onClick={() => setShowRecorder(true)}
+                    disabled={batch?.running}
+                  >
+                    🎙️ Gravar voz
                   </button>
-                  {batch.running && (
-                    <button className="danger small-button" onClick={cancel}>
-                      Cancelar lote
-                    </button>
-                  )}
+                  <button className="secondary" onClick={selectFiles} disabled={batch?.running}>
+                    Selecionar arquivos
+                  </button>
                 </div>
               </div>
 
-              <div className="items">
-                {batch.items.map((item, index) => {
-                  const badge = sourceBadgeConfig[item.source_kind] || { label: "Web", className: "badge-web" };
-                  const isRunningItem =
-                    item.status === "baixando" || item.status === "convertendo" || item.status === "transcrevendo";
+              {files.length > 0 && (
+                <div className="selected-files">
+                  {files.map((file) => (
+                    <span key={file}>
+                      <b>{file.split("/").pop()}</b>
+                      <button
+                        aria-label={`Remover ${file}`}
+                        onClick={() => setFiles((current) => current.filter((item) => item !== file))}
+                        disabled={batch?.running}
+                      >
+                        ×
+                      </button>
+                    </span>
+                  ))}
+                </div>
+              )}
 
-                  return (
-                    <article className="item" key={item.id}>
-                      <div className="item-status-col">
-                        <span className={`status ${item.status} ${isRunningItem ? "pulsing" : ""}`}>
-                          {statusLabel[item.status]}
-                        </span>
-                        <span className={`source-badge ${badge.className}`}>{badge.label}</span>
-                        {isRunningItem && item.progress > 0 && (
-                          <span className="progress-pill">{item.progress.toFixed(0)}%</span>
-                        )}
-                      </div>
+              <div className="composer-footer">
+                <span>
+                  {cleanCount} {cleanCount === 1 ? "mídia única" : "mídias únicas"} selecionada{cleanCount === 1 ? "" : "s"}
+                </span>
+                <button onClick={start} disabled={!cleanCount || !dependenciesReady || Boolean(batch?.running)}>
+                  {batch?.running ? "Processando lote..." : "Iniciar transcrição"}
+                </button>
+              </div>
+            </section>
 
-                      <div className="item-content">
-                        <div className="item-header">
-                          <strong>
-                            {String(index + 1).padStart(2, "0")} ·{" "}
-                            {item.title ||
-                              (item.source_kind === "drive"
-                                ? "Vídeo do Drive"
-                                : item.source_kind === "youtube"
-                                ? "Vídeo do YouTube"
-                                : item.source_kind === "video_file" || item.source_kind === "audio_file"
-                                ? "Arquivo local"
-                                : "Mídia Web")}
-                          </strong>
+            {batch && (
+              <section className="card queue">
+                <div className="section-title">
+                  <div>
+                    <p className="eyebrow">LOTE ATUAL</p>
+                    <h2>{batch.running ? "Em processamento" : batch.cancelled ? "Lote cancelado" : "Lote finalizado"}</h2>
+                    <p className="path" title={batch.output_dir}>
+                      📁 {batch.output_dir}
+                    </p>
+                  </div>
+                  <div className="queue-actions">
+                    <button className="secondary small-button" onClick={() => openInFinder(batch.output_dir)}>
+                      Abrir pasta do lote
+                    </button>
+                    {batch.running && (
+                      <button className="danger small-button" onClick={cancel}>
+                        Cancelar lote
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                <div className="items">
+                  {batch.items.map((item, index) => {
+                    const badge = sourceBadgeConfig[item.source_kind] || { label: "Web", className: "badge-web" };
+                    const isRunningItem =
+                      item.status === "baixando" || item.status === "convertendo" || item.status === "transcrevendo";
+
+                    return (
+                      <article className="item" key={item.id}>
+                        <div className="item-status-col">
+                          <span className={`status ${item.status} ${isRunningItem ? "pulsing" : ""}`}>
+                            {statusLabel[item.status]}
+                          </span>
+                          <span className={`source-badge ${badge.className}`}>{badge.label}</span>
+                          {isRunningItem && item.progress > 0 && (
+                            <span className="progress-pill">{item.progress.toFixed(0)}%</span>
+                          )}
                         </div>
 
-                        <p className="url" title={item.source}>
-                          {item.source_kind === "video_file" || item.source_kind === "audio_file"
-                            ? `Local: ${item.source}`
-                            : item.source}
-                        </p>
-
-                        {/* Barra de Progresso Granular */}
-                        {isRunningItem && (
-                          <div className="progress-bar-container">
-                            <div
-                              className="progress-bar-fill"
-                              style={{ width: `${Math.max(item.progress, 5)}%` }}
-                            />
+                        <div className="item-content">
+                          <div className="item-header">
+                            <strong>
+                              {String(index + 1).padStart(2, "0")} ·{" "}
+                              {item.title ||
+                                (item.source_kind === "drive"
+                                  ? "Vídeo do Drive"
+                                  : item.source_kind === "youtube"
+                                  ? "Vídeo do YouTube"
+                                  : item.source_kind === "video_file" || item.source_kind === "audio_file"
+                                  ? "Arquivo local"
+                                  : "Mídia Web")}
+                            </strong>
                           </div>
-                        )}
 
-                        {item.stage && isRunningItem && <p className="stage-text">⚡ {item.stage}</p>}
+                          <p className="url" title={item.source}>
+                            {item.source_kind === "video_file" || item.source_kind === "audio_file"
+                              ? `Local: ${item.source}`
+                              : item.source}
+                          </p>
 
-                        {item.error && <p className="item-error">❌ {item.error}</p>}
-                        {!isRunningItem && item.log.length > 0 && (
-                          <p className="log">{item.log[item.log.length - 1]}</p>
-                        )}
+                          {/* Barra de Progresso Granular */}
+                          {isRunningItem && (
+                            <div className="progress-bar-container">
+                              <div
+                                className="progress-bar-fill"
+                                style={{ width: `${Math.max(item.progress, 5)}%` }}
+                              />
+                            </div>
+                          )}
 
-                        {item.status === "concluido" && (
-                          <div className="item-actions">
-                            <button
-                              className="small-button primary"
-                              onClick={() =>
-                                openViewer({
-                                  title: item.title || "Transcrição",
-                                  source: item.source,
-                                  source_kind: item.source_kind,
-                                  output_dir: item.output_dir,
-                                })
-                              }
-                            >
-                              👁 Ver transcrição & formatos
-                            </button>
-                            <button
-                              className={`small-button secondary ${copiedId === item.id ? "success" : ""}`}
-                              onClick={() => copyTranscript(item.output_dir, item.id)}
-                            >
-                              {copiedId === item.id ? "✓ Copiado!" : "📋 Copiar texto"}
-                            </button>
-                            <button className="small-button secondary" onClick={() => openInFinder(item.output_dir)}>
-                              📁 Ver no Finder
-                            </button>
-                          </div>
-                        )}
+                          {item.stage && isRunningItem && <p className="stage-text">⚡ {item.stage}</p>}
+
+                          {item.error && <p className="item-error">❌ {item.error}</p>}
+                          {!isRunningItem && item.log.length > 0 && (
+                            <p className="log">{item.log[item.log.length - 1]}</p>
+                          )}
+
+                          {item.status === "concluido" && (
+                            <div className="item-actions">
+                              <button
+                                className="small-button primary"
+                                onClick={() =>
+                                  openViewer({
+                                    title: item.title || "Transcrição",
+                                    source: item.source,
+                                    source_kind: item.source_kind,
+                                    output_dir: item.output_dir,
+                                  })
+                                }
+                              >
+                                🎙️ Player & Transcrição
+                              </button>
+                              <button
+                                className={`small-button secondary ${copiedId === item.id ? "success" : ""}`}
+                                onClick={() => copyTranscript(item.output_dir, item.id)}
+                              >
+                                {copiedId === item.id ? "✓ Copiado!" : "📋 Copiar texto"}
+                              </button>
+                              <button className="small-button secondary" onClick={() => openInFinder(item.output_dir)}>
+                                📁 Ver no Finder
+                              </button>
+                            </div>
+                          )}
+                        </div>
+
+                        <div className="item-end">
+                          {item.status === "concluido" && <span className="done">✓</span>}
+                        </div>
+                      </article>
+                    );
+                  })}
+                </div>
+              </section>
+            )}
+          </>
+        )}
+
+        {/* ABA: HISTÓRICO LOCAL */}
+        {activeTab === "history" && (
+          <section className="card history-section">
+            <div className="section-title history-header">
+              <div>
+                <p className="eyebrow">HISTÓRICO PERSISTENTE</p>
+                <h2>Transcrições Realizadas</h2>
+              </div>
+              {history.length > 0 && (
+                <button className="secondary small-button" onClick={clearAllHistory}>
+                  🗑 Limpar histórico
+                </button>
+              )}
+            </div>
+
+            <div className="history-stats-bar">
+              <div className="stat-card">
+                <span className="stat-label">Total de transcrições</span>
+                <strong className="stat-value">{history.length}</strong>
+              </div>
+              <div className="stat-card">
+                <span className="stat-label">Palavras transcritas</span>
+                <strong className="stat-value">{totalWordsTranscribed.toLocaleString("pt-BR")}</strong>
+              </div>
+              <div className="stat-card search-card">
+                <input
+                  className="search-input"
+                  placeholder="🔍 Buscar por título, link, palavra-chave..."
+                  value={historySearch}
+                  onChange={(e) => setHistorySearch(e.target.value)}
+                />
+                {historySearch && (
+                  <button className="clear-search" onClick={() => setHistorySearch("")}>
+                    ×
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {filteredHistory.length === 0 ? (
+              <div className="empty-history">
+                <div className="empty-icon">📂</div>
+                <h3>{historySearch ? "Nenhuma transcrição encontrada para a busca." : "Nenhuma transcrição no histórico."}</h3>
+                <p className="muted">
+                  {historySearch
+                    ? "Tente outro termo ou limpe a caixa de pesquisa."
+                    : "As transcrições concluídas aparecerão aqui automaticamente."}
+                </p>
+              </div>
+            ) : (
+              <div className="history-list">
+                {filteredHistory.map((item) => {
+                  const badge = sourceBadgeConfig[item.source_kind] || { label: "Web", className: "badge-web" };
+                  const formattedDate = new Date(item.created_at).toLocaleString("pt-BR", {
+                    day: "2-digit",
+                    month: "2-digit",
+                    year: "numeric",
+                    hour: "2-digit",
+                    minute: "2-digit",
+                  });
+
+                  return (
+                    <article className="history-card" key={item.id}>
+                      <div className="history-card-header">
+                        <div className="history-meta">
+                          <span className={`source-badge ${badge.className}`}>{badge.label}</span>
+                          <span className="history-date">🕒 {formattedDate}</span>
+                          <span className="history-model">🤖 {item.model_name}</span>
+                          <span className="history-words">📝 {item.word_count.toLocaleString("pt-BR")} palavras</span>
+                        </div>
+                        <button
+                          className="delete-history-btn"
+                          title="Remover do histórico"
+                          onClick={() => deleteHistoryItem(item.id)}
+                        >
+                          ×
+                        </button>
                       </div>
 
-                      <div className="item-end">
-                        {item.status === "concluido" && <span className="done">✓</span>}
+                      <h3 className="history-title">{item.title}</h3>
+                      <p className="history-source" title={item.source}>
+                        🔗 {item.source}
+                      </p>
+
+                      {item.preview_text && (
+                        <div className="history-preview">
+                          <p>"{item.preview_text}..."</p>
+                        </div>
+                      )}
+
+                      <div className="history-formats">
+                        <span className="formats-label">Formatos:</span>
+                        {item.formats.map((f) => (
+                          <span className="format-tag" key={f}>
+                            .{f.toUpperCase()}
+                          </span>
+                        ))}
+                      </div>
+
+                      <div className="history-actions">
+                        <button
+                          className="small-button primary"
+                          onClick={() =>
+                            openViewer({
+                              title: item.title,
+                              source: item.source,
+                              source_kind: item.source_kind,
+                              output_dir: item.output_dir,
+                            })
+                          }
+                        >
+                          🎙️ Player & Transcrição
+                        </button>
+                        <button
+                          className={`small-button secondary ${copiedId === item.id ? "success" : ""}`}
+                          onClick={() => copyTranscript(item.output_dir, item.id)}
+                        >
+                          {copiedId === item.id ? "✓ Copiado!" : "📋 Copiar texto"}
+                        </button>
+                        <button className="small-button secondary" onClick={() => openInFinder(item.output_dir)}>
+                          📁 Ver no Finder
+                        </button>
                       </div>
                     </article>
                   );
                 })}
               </div>
-            </section>
-          )}
-        </>
-      )}
-
-      {/* ABA: HISTÓRICO LOCAL */}
-      {activeTab === "history" && (
-        <section className="card history-section">
-          <div className="section-title history-header">
-            <div>
-              <p className="eyebrow">HISTÓRICO PERSISTENTE</p>
-              <h2>Transcrições Realizadas</h2>
-            </div>
-            {history.length > 0 && (
-              <button className="secondary small-button" onClick={clearAllHistory}>
-                🗑 Limpar histórico
-              </button>
             )}
-          </div>
+          </section>
+        )}
 
-          <div className="history-stats-bar">
-            <div className="stat-card">
-              <span className="stat-label">Total de transcrições</span>
-              <strong className="stat-value">{history.length}</strong>
-            </div>
-            <div className="stat-card">
-              <span className="stat-label">Palavras transcritas</span>
-              <strong className="stat-value">{totalWordsTranscribed.toLocaleString("pt-BR")}</strong>
-            </div>
-            <div className="stat-card search-card">
-              <input
-                className="search-input"
-                placeholder="🔍 Buscar por título, link, palavra-chave..."
-                value={historySearch}
-                onChange={(e) => setHistorySearch(e.target.value)}
-              />
-              {historySearch && (
-                <button className="clear-search" onClick={() => setHistorySearch("")}>
+        {/* MODAL: VISUALIZADOR MULTI-FORMATO & PLAYER SINCRONIZADO */}
+        {viewing && (
+          <div className="backdrop" onClick={() => setViewing(null)}>
+            <section className="modal card viewer-modal" onClick={(e) => e.stopPropagation()}>
+              <div className="section-title">
+                <div className="viewer-title-row">
+                  <span className={`source-badge ${sourceBadgeConfig[viewing.target.source_kind]?.className}`}>
+                    {sourceBadgeConfig[viewing.target.source_kind]?.label}
+                  </span>
+                  <h2>{viewing.target.title}</h2>
+                </div>
+                <div className="viewer-top-actions">
+                  <button
+                    type="button"
+                    className={`small-button ${viewing.isEditing ? "success" : "secondary"}`}
+                    onClick={() => setViewing({ ...viewing, isEditing: !viewing.isEditing })}
+                  >
+                    {viewing.isEditing ? "👁️ Visualizar" : "✏️ Editar texto"}
+                  </button>
+                  <button className="icon" onClick={() => setViewing(null)}>
+                    ×
+                  </button>
+                </div>
+              </div>
+
+              {viewing.loading && <div className="viewer-loading">Carregando transcrição e áudio...</div>}
+
+              {viewing.error && <div className="notice error">{viewing.error}</div>}
+
+              {viewing.saveSuccess && (
+                <div className="notice success">
+                  <span>✓ Transcrição e arquivos atualizados com sucesso!</span>
+                </div>
+              )}
+
+              {!viewing.loading && !viewing.error && viewing.bundle && (
+                <>
+                  {/* Barra de Abas de Formatos & Player */}
+                  <div className="viewer-tabs-bar">
+                    {viewing.segments.length > 0 && (
+                      <button
+                        className={`viewer-tab ${viewing.selectedFormat === "sync" ? "active" : ""}`}
+                        onClick={() => setViewing({ ...viewing, selectedFormat: "sync" })}
+                      >
+                        🎙️ Player Sincronizado
+                      </button>
+                    )}
+                    <button
+                      className={`viewer-tab ${viewing.selectedFormat === "txt" ? "active" : ""}`}
+                      onClick={() => setViewing({ ...viewing, selectedFormat: "txt" })}
+                    >
+                      📄 Texto (.txt)
+                    </button>
+                    <button
+                      className={`viewer-tab ${viewing.selectedFormat === "srt" ? "active" : ""}`}
+                      onClick={() => setViewing({ ...viewing, selectedFormat: "srt" })}
+                    >
+                      🎬 Legendas (.srt)
+                    </button>
+                    <button
+                      className={`viewer-tab ${viewing.selectedFormat === "vtt" ? "active" : ""}`}
+                      onClick={() => setViewing({ ...viewing, selectedFormat: "vtt" })}
+                    >
+                      🌐 WebVTT (.vtt)
+                    </button>
+                    <button
+                      className={`viewer-tab ${viewing.selectedFormat === "md" ? "active" : ""}`}
+                      onClick={() => setViewing({ ...viewing, selectedFormat: "md" })}
+                    >
+                      📑 Markdown (.md)
+                    </button>
+                    <button
+                      className={`viewer-tab ${viewing.selectedFormat === "json" ? "active" : ""}`}
+                      onClick={() => setViewing({ ...viewing, selectedFormat: "json" })}
+                    >
+                      🧩 JSON (.json)
+                    </button>
+                  </div>
+
+                  <div className="viewer-stats">
+                    <span>
+                      Palavras: <b>{viewing.bundle.txt.trim().split(/\s+/).filter(Boolean).length}</b>
+                    </span>
+                    <span>
+                      Caracteres: <b>{viewing.bundle.txt.length}</b>
+                    </span>
+                    {viewing.segments.length > 0 && (
+                      <span>
+                        Segmentos: <b>{viewing.segments.length}</b>
+                      </span>
+                    )}
+                    <span className="viewer-path" title={viewing.target.output_dir}>
+                      📁 {viewing.target.output_dir}
+                    </span>
+                  </div>
+
+                  {/* Conteúdo Principal da Aba */}
+                  {viewing.selectedFormat === "sync" ? (
+                    <AudioPlayerSync
+                      outputDir={viewing.target.output_dir}
+                      segments={viewing.segments}
+                      isEditing={viewing.isEditing}
+                      onSegmentsChange={(updated) => setViewing({ ...viewing, segments: updated })}
+                    />
+                  ) : viewing.isEditing ? (
+                    <div className="editor-container">
+                      <textarea
+                        className="full-editor-textarea"
+                        value={viewing.editedTxt}
+                        onChange={(e) => setViewing({ ...viewing, editedTxt: e.target.value })}
+                        placeholder="Edite o texto completo da transcrição..."
+                      />
+                    </div>
+                  ) : (
+                    <div className="transcript-box">
+                      <pre>{currentViewerText}</pre>
+                    </div>
+                  )}
+
+                  <div className="modal-actions">
+                    <button className="secondary" onClick={() => openInFinder(viewing.target.output_dir)}>
+                      📁 Abrir pasta
+                    </button>
+
+                    {viewing.isEditing ? (
+                      <button
+                        className="primary success"
+                        onClick={saveEdits}
+                        disabled={viewing.savingEdits}
+                      >
+                        {viewing.savingEdits ? "Salvando..." : "💾 Salvar alterações"}
+                      </button>
+                    ) : (
+                      <button className={`primary ${viewerCopied ? "success" : ""}`} onClick={copyViewerCurrentText}>
+                        {viewerCopied
+                          ? `✓ Copiado (.${viewing.selectedFormat})!`
+                          : `📋 Copiar .${viewing.selectedFormat.toUpperCase()}`}
+                      </button>
+                    )}
+
+                    <button className="secondary" onClick={() => setViewing(null)}>
+                      Fechar
+                    </button>
+                  </div>
+                </>
+              )}
+            </section>
+          </div>
+        )}
+
+        {/* MODAL: GRAVADOR DE ÁUDIO / MICROFONE */}
+        <AudioRecorderModal
+          isOpen={showRecorder}
+          onClose={() => setShowRecorder(false)}
+          onRecordingComplete={(savedPath) => {
+            setFiles((current) => [...new Set([...current, savedPath])]);
+            setActiveTab("composer");
+          }}
+        />
+
+        {/* MODAL: CONFIGURAÇÕES & GERENCIADOR DE MODELOS */}
+        {showSettings && prefs && (
+          <div className="backdrop" onClick={() => setShowSettings(false)}>
+            <section className="modal card settings-modal" onClick={(e) => e.stopPropagation()}>
+              <div className="section-title">
+                <div>
+                  <h2>Configurações locais & Modelos</h2>
+                  <p className="muted">Gerencie os modelos Whisper GGML e executáveis no Mac.</p>
+                </div>
+                <button className="icon" onClick={() => setShowSettings(false)}>
                   ×
                 </button>
-              )}
-            </div>
-          </div>
-
-          {filteredHistory.length === 0 ? (
-            <div className="empty-history">
-              <div className="empty-icon">📂</div>
-              <h3>{historySearch ? "Nenhuma transcrição encontrada para a busca." : "Nenhuma transcrição no histórico."}</h3>
-              <p className="muted">
-                {historySearch
-                  ? "Tente outro termo ou limpe a caixa de pesquisa."
-                  : "As transcrições concluídas aparecerão aqui automaticamente."}
-              </p>
-            </div>
-          ) : (
-            <div className="history-list">
-              {filteredHistory.map((item) => {
-                const badge = sourceBadgeConfig[item.source_kind] || { label: "Web", className: "badge-web" };
-                const formattedDate = new Date(item.created_at).toLocaleString("pt-BR", {
-                  day: "2-digit",
-                  month: "2-digit",
-                  year: "numeric",
-                  hour: "2-digit",
-                  minute: "2-digit",
-                });
-
-                return (
-                  <article className="history-card" key={item.id}>
-                    <div className="history-card-header">
-                      <div className="history-meta">
-                        <span className={`source-badge ${badge.className}`}>{badge.label}</span>
-                        <span className="history-date">🕒 {formattedDate}</span>
-                        <span className="history-model">🤖 {item.model_name}</span>
-                        <span className="history-words">📝 {item.word_count.toLocaleString("pt-BR")} palavras</span>
-                      </div>
-                      <button
-                        className="delete-history-btn"
-                        title="Remover do histórico"
-                        onClick={() => deleteHistoryItem(item.id)}
-                      >
-                        ×
-                      </button>
-                    </div>
-
-                    <h3 className="history-title">{item.title}</h3>
-                    <p className="history-source" title={item.source}>
-                      🔗 {item.source}
-                    </p>
-
-                    {item.preview_text && (
-                      <div className="history-preview">
-                        <p>"{item.preview_text}..."</p>
-                      </div>
-                    )}
-
-                    <div className="history-formats">
-                      <span className="formats-label">Formatos gerados:</span>
-                      {item.formats.map((f) => (
-                        <span className="format-tag" key={f}>
-                          .{f.toUpperCase()}
-                        </span>
-                      ))}
-                    </div>
-
-                    <div className="history-actions">
-                      <button
-                        className="small-button primary"
-                        onClick={() =>
-                          openViewer({
-                            title: item.title,
-                            source: item.source,
-                            source_kind: item.source_kind,
-                            output_dir: item.output_dir,
-                          })
-                        }
-                      >
-                        👁 Ver transcrição & formatos
-                      </button>
-                      <button
-                        className={`small-button secondary ${copiedId === item.id ? "success" : ""}`}
-                        onClick={() => copyTranscript(item.output_dir, item.id)}
-                      >
-                        {copiedId === item.id ? "✓ Copiado!" : "📋 Copiar texto"}
-                      </button>
-                      <button className="small-button secondary" onClick={() => openInFinder(item.output_dir)}>
-                        📁 Ver no Finder
-                      </button>
-                    </div>
-                  </article>
-                );
-              })}
-            </div>
-          )}
-        </section>
-      )}
-
-      {/* MODAL: VISUALIZADOR MULTI-FORMATO */}
-      {viewing && (
-        <div className="backdrop" onClick={() => setViewing(null)}>
-          <section className="modal card viewer-modal" onClick={(e) => e.stopPropagation()}>
-            <div className="section-title">
-              <div>
-                <span className={`source-badge ${sourceBadgeConfig[viewing.target.source_kind]?.className}`}>
-                  {sourceBadgeConfig[viewing.target.source_kind]?.label}
-                </span>
-                <h2>{viewing.target.title}</h2>
               </div>
-              <button className="icon" onClick={() => setViewing(null)}>
-                ×
-              </button>
-            </div>
 
-            {viewing.loading && <div className="viewer-loading">Carregando formatos de transcrição...</div>}
+              <div className="settings-fields">
+                {/* GERENCIADOR DE MODELOS WHISPER */}
+                <div className="models-manager-section">
+                  <div className="models-header">
+                    <h3>🧠 Modelos Whisper GGML (whisper.cpp)</h3>
+                    <p className="muted">Baixe e alterne modelos oficiais com 1 clique.</p>
+                  </div>
 
-            {viewing.error && <div className="notice error">{viewing.error}</div>}
+                  <div className="models-grid">
+                    {models.map((model) => {
+                      const prog = downloadProgress[model.id];
+                      const isDownloading = prog?.status === "downloading";
 
-            {!viewing.loading && !viewing.error && viewing.bundle && (
-              <>
-                <div className="viewer-tabs-bar">
-                  <button
-                    className={`viewer-tab ${viewing.selectedFormat === "txt" ? "active" : ""}`}
-                    onClick={() => setViewing({ ...viewing, selectedFormat: "txt" })}
-                  >
-                    📄 Texto (.txt)
-                  </button>
-                  <button
-                    className={`viewer-tab ${viewing.selectedFormat === "srt" ? "active" : ""}`}
-                    onClick={() => setViewing({ ...viewing, selectedFormat: "srt" })}
-                  >
-                    🎬 Legendas (.srt)
-                  </button>
-                  <button
-                    className={`viewer-tab ${viewing.selectedFormat === "vtt" ? "active" : ""}`}
-                    onClick={() => setViewing({ ...viewing, selectedFormat: "vtt" })}
-                  >
-                    🌐 WebVTT (.vtt)
-                  </button>
-                  <button
-                    className={`viewer-tab ${viewing.selectedFormat === "md" ? "active" : ""}`}
-                    onClick={() => setViewing({ ...viewing, selectedFormat: "md" })}
-                  >
-                    📑 Markdown (.md)
-                  </button>
-                  <button
-                    className={`viewer-tab ${viewing.selectedFormat === "json" ? "active" : ""}`}
-                    onClick={() => setViewing({ ...viewing, selectedFormat: "json" })}
-                  >
-                    🧩 JSON (.json)
-                  </button>
-                </div>
+                      return (
+                        <div
+                          className={`model-card ${model.is_active ? "active-model" : ""} ${
+                            model.is_downloaded ? "downloaded" : ""
+                          }`}
+                          key={model.id}
+                        >
+                          <div className="model-card-top">
+                            <div className="model-name-row">
+                              <strong>{model.name}</strong>
+                              {model.is_active ? (
+                                <span className="model-pill active">✓ Em uso</span>
+                              ) : model.is_downloaded ? (
+                                <span className="model-pill installed">Instalado</span>
+                              ) : (
+                                <span className="model-pill available">Disponível</span>
+                              )}
+                            </div>
+                            <p className="model-desc">{model.description}</p>
+                          </div>
 
-                <div className="viewer-stats">
-                  <span>
-                    Palavras: <b>{viewing.bundle.txt.trim().split(/\s+/).filter(Boolean).length}</b>
-                  </span>
-                  <span>
-                    Caracteres: <b>{viewing.bundle.txt.length}</b>
-                  </span>
-                  <span className="viewer-path" title={viewing.target.output_dir}>
-                    📁 {viewing.target.output_dir}
-                  </span>
-                </div>
+                          <div className="model-specs">
+                            <span>📦 {model.size_display}</span>
+                            <span>🧠 {model.ram_display} RAM</span>
+                            <span>⚡ {model.speed_display}</span>
+                          </div>
 
-                <div className="transcript-box">
-                  <pre>{currentViewerText}</pre>
-                </div>
+                          {isDownloading && (
+                            <div className="model-dl-progress">
+                              <div className="progress-bar-container">
+                                <div className="progress-bar-fill" style={{ width: `${prog.percentage}%` }} />
+                              </div>
+                              <div className="dl-status-row">
+                                <span>{prog.percentage.toFixed(1)}% baixado</span>
+                                <button className="small-button danger" onClick={() => cancelDownloadModel(model.id)}>
+                                  Cancelar
+                                </button>
+                              </div>
+                            </div>
+                          )}
 
-                <div className="modal-actions">
-                  <button className="secondary" onClick={() => openInFinder(viewing.target.output_dir)}>
-                    📁 Abrir pasta
-                  </button>
-                  <button className={`primary ${viewerCopied ? "success" : ""}`} onClick={copyViewerCurrentText}>
-                    {viewerCopied
-                      ? `✓ Copiado (.${viewing.selectedFormat})!`
-                      : `📋 Copiar .${viewing.selectedFormat.toUpperCase()}`}
-                  </button>
-                  <button className="secondary" onClick={() => setViewing(null)}>
-                    Fechar
-                  </button>
-                </div>
-              </>
-            )}
-          </section>
-        </div>
-      )}
-
-      {/* MODAL: CONFIGURAÇÕES & GERENCIADOR DE MODELOS */}
-      {showSettings && prefs && (
-        <div className="backdrop" onClick={() => setShowSettings(false)}>
-          <section className="modal card settings-modal" onClick={(e) => e.stopPropagation()}>
-            <div className="section-title">
-              <div>
-                <h2>Configurações locais & Modelos</h2>
-                <p className="muted">Gerencie os modelos Whisper GGML e executáveis no Mac.</p>
-              </div>
-              <button className="icon" onClick={() => setShowSettings(false)}>
-                ×
-              </button>
-            </div>
-
-            <div className="settings-fields">
-              {/* GERENCIADOR DE MODELOS WHISPER */}
-              <div className="models-manager-section">
-                <div className="models-header">
-                  <h3>🧠 Modelos Whisper GGML (whisper.cpp)</h3>
-                  <p className="muted">Baixe e alterne modelos oficiais com 1 clique.</p>
-                </div>
-
-                <div className="models-grid">
-                  {models.map((model) => {
-                    const prog = downloadProgress[model.id];
-                    const isDownloading = prog?.status === "downloading";
-
-                    return (
-                      <div
-                        className={`model-card ${model.is_active ? "active-model" : ""} ${
-                          model.is_downloaded ? "downloaded" : ""
-                        }`}
-                        key={model.id}
-                      >
-                        <div className="model-card-top">
-                          <div className="model-name-row">
-                            <strong>{model.name}</strong>
-                            {model.is_active ? (
-                              <span className="model-pill active">✓ Em uso</span>
-                            ) : model.is_downloaded ? (
-                              <span className="model-pill installed">Instalado</span>
+                          <div className="model-card-actions">
+                            {model.is_downloaded ? (
+                              model.is_active ? (
+                                <button className="small-button secondary" disabled>
+                                  Modelo selecionado
+                                </button>
+                              ) : (
+                                <button
+                                  className="small-button primary"
+                                  onClick={() => model.local_path && activateModel(model.local_path)}
+                                >
+                                  Usar este modelo
+                                </button>
+                              )
+                            ) : isDownloading ? (
+                              <button className="small-button secondary" disabled>
+                                Baixando...
+                              </button>
                             ) : (
-                              <span className="model-pill available">Disponível</span>
+                              <button className="small-button secondary" onClick={() => downloadModel(model.id)}>
+                                ⬇ Baixar ({model.size_display})
+                              </button>
                             )}
                           </div>
-                          <p className="model-desc">{model.description}</p>
                         </div>
+                      );
+                    })}
+                  </div>
+                </div>
 
-                        <div className="model-specs">
-                          <span>📦 {model.size_display}</span>
-                          <span>🧠 {model.ram_display} RAM</span>
-                          <span>⚡ {model.speed_display}</span>
-                        </div>
+                {/* CAMINHOS MANUAIS DAS FERRAMENTAS */}
+                <div className="tools-paths-section">
+                  <h3>🛠️ Executáveis do Sistema</h3>
 
-                        {isDownloading && (
-                          <div className="model-dl-progress">
-                            <div className="progress-bar-container">
-                              <div className="progress-bar-fill" style={{ width: `${prog.percentage}%` }} />
-                            </div>
-                            <div className="dl-status-row">
-                              <span>{prog.percentage.toFixed(1)}% baixado</span>
-                              <button className="small-button danger" onClick={() => cancelDownloadModel(model.id)}>
-                                Cancelar
-                              </button>
-                            </div>
-                          </div>
-                        )}
+                  <div className="field-group">
+                    <div className="field-header">
+                      <label htmlFor="yt_dlp_path">yt-dlp (Download de mídia)</label>
+                      {diagnostic?.checks.find((c) => c.name === "yt-dlp")?.available ? (
+                        <span className="diag-badge ok">✓ Encontrado</span>
+                      ) : (
+                        <span className="diag-badge missing">⚠️ Não encontrado</span>
+                      )}
+                    </div>
+                    <div className="input-with-button">
+                      <input
+                        id="yt_dlp_path"
+                        value={prefs.yt_dlp_path}
+                        onChange={(e) => setPrefs({ ...prefs, yt_dlp_path: e.target.value })}
+                      />
+                      <button
+                        type="button"
+                        className="secondary small-button"
+                        onClick={() => browseFile("yt_dlp_path", "Selecionar executável yt-dlp")}
+                      >
+                        Procurar...
+                      </button>
+                    </div>
+                  </div>
 
-                        <div className="model-card-actions">
-                          {model.is_downloaded ? (
-                            model.is_active ? (
-                              <button className="small-button secondary" disabled>
-                                Modelo selecionado
-                              </button>
-                            ) : (
-                              <button
-                                className="small-button primary"
-                                onClick={() => model.local_path && activateModel(model.local_path)}
-                              >
-                                Usar este modelo
-                              </button>
-                            )
-                          ) : isDownloading ? (
-                            <button className="small-button secondary" disabled>
-                              Baixando...
-                            </button>
-                          ) : (
-                            <button className="small-button secondary" onClick={() => downloadModel(model.id)}>
-                              ⬇ Baixar ({model.size_display})
-                            </button>
-                          )}
-                        </div>
-                      </div>
-                    );
-                  })}
+                  <div className="field-group">
+                    <div className="field-header">
+                      <label htmlFor="ffmpeg_path">ffmpeg (Conversão de áudio)</label>
+                      {diagnostic?.checks.find((c) => c.name === "ffmpeg")?.available ? (
+                        <span className="diag-badge ok">✓ Encontrado</span>
+                      ) : (
+                        <span className="diag-badge missing">⚠️ Não encontrado</span>
+                      )}
+                    </div>
+                    <div className="input-with-button">
+                      <input
+                        id="ffmpeg_path"
+                        value={prefs.ffmpeg_path}
+                        onChange={(e) => setPrefs({ ...prefs, ffmpeg_path: e.target.value })}
+                      />
+                      <button
+                        type="button"
+                        className="secondary small-button"
+                        onClick={() => browseFile("ffmpeg_path", "Selecionar executável ffmpeg")}
+                      >
+                        Procurar...
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="field-group">
+                    <div className="field-header">
+                      <label htmlFor="whisper_path">whisper-cli (whisper.cpp)</label>
+                      {diagnostic?.checks.find((c) => c.name === "whisper-cli")?.available ? (
+                        <span className="diag-badge ok">✓ Encontrado</span>
+                      ) : (
+                        <span className="diag-badge missing">⚠️ Não encontrado</span>
+                      )}
+                    </div>
+                    <div className="input-with-button">
+                      <input
+                        id="whisper_path"
+                        value={prefs.whisper_path}
+                        onChange={(e) => setPrefs({ ...prefs, whisper_path: e.target.value })}
+                      />
+                      <button
+                        type="button"
+                        className="secondary small-button"
+                        onClick={() => browseFile("whisper_path", "Selecionar executável whisper-cli")}
+                      >
+                        Procurar...
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="field-group">
+                    <div className="field-header">
+                      <label htmlFor="model_path">Caminho do modelo ativo (.bin)</label>
+                      {diagnostic?.checks.find((c) => c.name === "Modelo Whisper")?.available ? (
+                        <span className="diag-badge ok">✓ Encontrado</span>
+                      ) : (
+                        <span className="diag-badge missing">⚠️ Não encontrado</span>
+                      )}
+                    </div>
+                    <div className="input-with-button">
+                      <input
+                        id="model_path"
+                        value={prefs.model_path}
+                        onChange={(e) => setPrefs({ ...prefs, model_path: e.target.value })}
+                      />
+                      <button
+                        type="button"
+                        className="secondary small-button"
+                        onClick={() => browseFile("model_path", "Selecionar modelo Whisper", ["bin"])}
+                      >
+                        Procurar...
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="field-group">
+                    <div className="field-header">
+                      <label htmlFor="output_dir">Pasta-base de saída das transcrições</label>
+                    </div>
+                    <div className="input-with-button">
+                      <input
+                        id="output_dir"
+                        value={prefs.output_dir}
+                        onChange={(e) => setPrefs({ ...prefs, output_dir: e.target.value })}
+                      />
+                      <button
+                        type="button"
+                        className="secondary small-button"
+                        onClick={() => browseDirectory("output_dir", "Selecionar pasta-base de saída")}
+                      >
+                        Selecionar...
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="field-group">
+                    <label htmlFor="concurrency">Processamentos simultâneos</label>
+                    <select
+                      id="concurrency"
+                      value={prefs.concurrency}
+                      onChange={(e) => setPrefs({ ...prefs, concurrency: Number(e.target.value) })}
+                    >
+                      <option value="1">1 (recomendado para Whisper local)</option>
+                      <option value="2">2 (maior uso de CPU/GPU)</option>
+                    </select>
+                  </div>
                 </div>
               </div>
 
-              {/* CAMINHOS MANUAIS DAS FERRAMENTAS */}
-              <div className="tools-paths-section">
-                <h3>🛠️ Executáveis do Sistema</h3>
-
-                <div className="field-group">
-                  <div className="field-header">
-                    <label htmlFor="yt_dlp_path">yt-dlp (Download de mídia)</label>
-                    {diagnostic?.checks.find((c) => c.name === "yt-dlp")?.available ? (
-                      <span className="diag-badge ok">✓ Encontrado</span>
-                    ) : (
-                      <span className="diag-badge missing">⚠️ Não encontrado</span>
-                    )}
-                  </div>
-                  <div className="input-with-button">
-                    <input
-                      id="yt_dlp_path"
-                      value={prefs.yt_dlp_path}
-                      onChange={(e) => setPrefs({ ...prefs, yt_dlp_path: e.target.value })}
-                    />
-                    <button
-                      type="button"
-                      className="secondary small-button"
-                      onClick={() => browseFile("yt_dlp_path", "Selecionar executável yt-dlp")}
-                    >
-                      Procurar...
-                    </button>
-                  </div>
-                </div>
-
-                <div className="field-group">
-                  <div className="field-header">
-                    <label htmlFor="ffmpeg_path">ffmpeg (Conversão de áudio)</label>
-                    {diagnostic?.checks.find((c) => c.name === "ffmpeg")?.available ? (
-                      <span className="diag-badge ok">✓ Encontrado</span>
-                    ) : (
-                      <span className="diag-badge missing">⚠️ Não encontrado</span>
-                    )}
-                  </div>
-                  <div className="input-with-button">
-                    <input
-                      id="ffmpeg_path"
-                      value={prefs.ffmpeg_path}
-                      onChange={(e) => setPrefs({ ...prefs, ffmpeg_path: e.target.value })}
-                    />
-                    <button
-                      type="button"
-                      className="secondary small-button"
-                      onClick={() => browseFile("ffmpeg_path", "Selecionar executável ffmpeg")}
-                    >
-                      Procurar...
-                    </button>
-                  </div>
-                </div>
-
-                <div className="field-group">
-                  <div className="field-header">
-                    <label htmlFor="whisper_path">whisper-cli (whisper.cpp)</label>
-                    {diagnostic?.checks.find((c) => c.name === "whisper-cli")?.available ? (
-                      <span className="diag-badge ok">✓ Encontrado</span>
-                    ) : (
-                      <span className="diag-badge missing">⚠️ Não encontrado</span>
-                    )}
-                  </div>
-                  <div className="input-with-button">
-                    <input
-                      id="whisper_path"
-                      value={prefs.whisper_path}
-                      onChange={(e) => setPrefs({ ...prefs, whisper_path: e.target.value })}
-                    />
-                    <button
-                      type="button"
-                      className="secondary small-button"
-                      onClick={() => browseFile("whisper_path", "Selecionar executável whisper-cli")}
-                    >
-                      Procurar...
-                    </button>
-                  </div>
-                </div>
-
-                <div className="field-group">
-                  <div className="field-header">
-                    <label htmlFor="model_path">Caminho do modelo ativo (.bin)</label>
-                    {diagnostic?.checks.find((c) => c.name === "Modelo Whisper")?.available ? (
-                      <span className="diag-badge ok">✓ Encontrado</span>
-                    ) : (
-                      <span className="diag-badge missing">⚠️ Não encontrado</span>
-                    )}
-                  </div>
-                  <div className="input-with-button">
-                    <input
-                      id="model_path"
-                      value={prefs.model_path}
-                      onChange={(e) => setPrefs({ ...prefs, model_path: e.target.value })}
-                    />
-                    <button
-                      type="button"
-                      className="secondary small-button"
-                      onClick={() => browseFile("model_path", "Selecionar modelo Whisper", ["bin"])}
-                    >
-                      Procurar...
-                    </button>
-                  </div>
-                </div>
-
-                <div className="field-group">
-                  <div className="field-header">
-                    <label htmlFor="output_dir">Pasta-base de saída das transcrições</label>
-                  </div>
-                  <div className="input-with-button">
-                    <input
-                      id="output_dir"
-                      value={prefs.output_dir}
-                      onChange={(e) => setPrefs({ ...prefs, output_dir: e.target.value })}
-                    />
-                    <button
-                      type="button"
-                      className="secondary small-button"
-                      onClick={() => browseDirectory("output_dir", "Selecionar pasta-base de saída")}
-                    >
-                      Selecionar...
-                    </button>
-                  </div>
-                </div>
-
-                <div className="field-group">
-                  <label htmlFor="concurrency">Processamentos simultâneos</label>
-                  <select
-                    id="concurrency"
-                    value={prefs.concurrency}
-                    onChange={(e) => setPrefs({ ...prefs, concurrency: Number(e.target.value) })}
-                  >
-                    <option value="1">1 (recomendado para Whisper local)</option>
-                    <option value="2">2 (maior uso de CPU/GPU)</option>
-                  </select>
-                </div>
+              <div className="modal-actions">
+                <button className="secondary" onClick={() => setShowSettings(false)}>
+                  Fechar
+                </button>
+                <button onClick={savePrefs}>Salvar configurações</button>
               </div>
-            </div>
-
-            <div className="modal-actions">
-              <button className="secondary" onClick={() => setShowSettings(false)}>
-                Fechar
-              </button>
-              <button onClick={savePrefs}>Salvar configurações</button>
-            </div>
-          </section>
-        </div>
-      )}
-    </main>
+            </section>
+          </div>
+        )}
+      </main>
+    </div>
   );
 }
 

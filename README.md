@@ -11,6 +11,10 @@ Cada lote cria uma pasta em `~/Downloads/Transcrições/<data-hora>/`, contendo 
   - Arquivos compartilhados do Google Drive.
   - Links de vídeo/áudio da Web suportados pelo `yt-dlp` (Vimeo, TikTok, etc.).
   - Arquivos locais no Mac: MP4, MOV, M4V, MKV, WebM, AVI, MP3, M4A, WAV, AAC, OGG, FLAC, AIFF e OPUS.
+  - **Gravação Direta**: Grave notas de voz ou reuniões pelo microfone do Mac com visualizador de ondas sonoras em tempo real.
+  - **Drag & Drop**: Arraste e solte vídeos, áudios ou links diretamente na janela do aplicativo.
+- **Player de Áudio Sincronizado**: Reproduza o áudio local com sincronização em tempo real de timestamps do Whisper, destaque automático do trecho falado e navegação clicável (clique em qualquer linha para saltar o áudio).
+- **Editor de Transcrições Integrado**: Corrija termos e pontuações diretamente na interface com salvamento em disco (`.txt`, `.srt`, `.md`) e sincronização no histórico.
 - **Gerenciador de Modelos In-App**: Baixe e alterne com 1 clique modelos GGML oficiais do Hugging Face (`tiny`, `base`, `small`, `medium`, `large-v3-turbo`, `large-v3`) com progresso em tempo real e métricas de RAM/velocidade.
 - **Múltiplos Formatos de Exportação**: Geração simultânea de `.txt` (texto plano), `.srt` (legendas com timestamps), `.vtt` (WebVTT), `.json` e `.md` (Markdown formatado).
 - **Progresso Granular em Tempo Real**: Barra de progresso animada com percentual contínuo do download via `yt-dlp` e da transcrição via `whisper.cpp`.

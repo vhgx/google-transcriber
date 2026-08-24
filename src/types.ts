@@ -14,7 +14,16 @@ export type SourceKind =
   | "video_file"
   | "audio_file";
 
-export type TranscriptFormat = "txt" | "srt" | "vtt" | "md" | "json";
+export type TranscriptFormat = "sync" | "txt" | "srt" | "vtt" | "md" | "json";
+
+export interface TranscriptSegment {
+  id: number;
+  start: number; // em segundos
+  end: number;   // em segundos
+  startFormatted: string;
+  endFormatted: string;
+  text: string;
+}
 
 export interface Preferences {
   yt_dlp_path: string;
@@ -103,5 +112,5 @@ export interface HistoryEntry {
   char_count: number;
   preview_text: string;
   model_name: string;
-  formats: TranscriptFormat[];
+  formats: string[];
 }
