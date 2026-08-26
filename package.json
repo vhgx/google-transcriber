@@ -6,7 +6,11 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
-    "tauri": "PATH=/opt/homebrew/opt/rust/bin:$PATH tauri"
+    "server": "PATH=/opt/homebrew/opt/rust/bin:$PATH cargo run --manifest-path src-server/Cargo.toml",
+    "tauri": "PATH=/opt/homebrew/opt/rust/bin:$PATH tauri",
+    "docker:build": "docker build -t yt-txt:latest .",
+    "docker:up": "docker compose up -d",
+    "docker:down": "docker compose down"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",

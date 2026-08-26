@@ -1,5 +1,5 @@
-import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useRef, useState } from "react";
+import { api } from "../services/api";
 import type { TranscriptSegment } from "../types";
 import { formatSecondsToTime } from "../utils/srtParser";
 
@@ -37,7 +37,7 @@ export function AudioPlayerSync({
     setLoadingAudio(true);
     setAudioError(null);
 
-    invoke<number[]>("read_audio_bytes", { outputDir })
+    api.readAudioBytes(outputDir)
       .then((bytes) => {
         const blob = new Blob([new Uint8Array(bytes)], { type: "audio/mp3" });
         objectUrl = URL.createObjectURL(blob);

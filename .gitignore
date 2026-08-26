@@ -1,4 +1,44 @@
+# Dependências e Builds
 node_modules/
 dist/
+target/
 src-tauri/target/
+src-server/target/
+
+# Dados Locais e Volumes Docker (mídias baixadas, gravações, histórico e modelos)
+data/
+downloads/
+models/
+uploads/
+recordings/
+*.bin
+
+# Arquivos de Áudio, Vídeo e Transcrições Geradas
+*.mp3
+*.wav
+*.m4a
+*.webm
+*.ogg
+*.flac
+*.aac
+*.opus
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.srt
+*.vtt
+*.lrc
+
+# Configurações e Logs Locais
+*.log
+.env
+.env.*
+*.local
+preferences.json
+history.json
+
+# Sistema Operacional
 .DS_Store
+Thumbs.db
+

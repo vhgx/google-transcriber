@@ -1,5 +1,5 @@
-import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useRef, useState } from "react";
+import { api, isTauri } from "../services/api";
 import { formatSecondsToTime } from "../utils/srtParser";
 
 interface AudioRecorderModalProps {
@@ -44,7 +44,7 @@ export function AudioRecorderModal({
       animationFrameRef.current = null;
     }
     if (modeRef.current === "native") {
-      invoke("cancel_native_recording").catch(() => {});
+      api.cancelNativeRecording().catch(() => {});
     }
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
       mediaRecorderRef.current.stop();
@@ -191,20 +191,25 @@ export function AudioRecorderModal({
     }
 
     // 2. Fallback nativo: grava diretamente pelo FFmpeg/AVFoundation no backend Rust
-    try {
-      modeRef.current = "native";
-      await invoke("start_native_recording");
-      setRecordingState("recording");
+    if (isTauri()) {
+      try {
+        modeRef.current = "native";
+        await api.startNativeRecording();
+        setRecordingState("recording");
 
-      setSeconds(0);
-      timerRef.current = window.setInterval(() => {
-        setSeconds((prev) => prev + 1);
-      }, 1000);
+        setSeconds(0);
+        timerRef.current = window.setInterval(() => {
+          setSeconds((prev) => prev + 1);
+        }, 1000);
 
-      drawSyntheticWaveform();
-    } catch (err) {
-      modeRef.current = null;
-      setError(`Não foi possível iniciar a gravação de áudio: ${err}`);
+        drawSyntheticWaveform();
+      } catch (err) {
+        modeRef.current = null;
+        setError(`Não foi possível iniciar a gravação de áudio: ${err}`);
+        setRecordingState("idle");
+      }
+    } else {
+      setError("Permissão de microfone negada ou microfone não encontrado.");
       setRecordingState("idle");
     }
   };
@@ -239,7 +244,7 @@ export function AudioRecorderModal({
 
     if (modeRef.current === "native") {
       try {
-        const savedPath = await invoke<string>("stop_native_recording");
+        const savedPath = await api.stopNativeRecording();
         cleanup();
         onRecordingComplete(savedPath);
         onClose();
@@ -264,10 +269,7 @@ export function AudioRecorderModal({
           now.getDate()
         )}_${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}.webm`;
 
-        const savedPath = await invoke<string>("save_recorded_audio", {
-          bytes,
-          filename,
-        });
+        const savedPath = await api.saveRecordedAudio(bytes, filename);
 
         cleanup();
         onRecordingComplete(savedPath);

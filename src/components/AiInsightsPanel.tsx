@@ -1,5 +1,5 @@
-import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useState } from "react";
+import { api } from "../services/api";
 import type { AiTemplateId, ChatMessage, Preferences } from "../types";
 
 interface AiInsightsPanelProps {
@@ -62,7 +62,8 @@ export function AiInsightsPanel({
 
   // Carregar insights salvos anteriormente
   useEffect(() => {
-    invoke<Array<[string, string, string]>>("list_saved_insights", { outputDir })
+    api
+      .listSavedInsights(outputDir)
       .then((saved) => {
         const found = saved.find(([id]) => id === selectedTemplate);
         if (found) {
@@ -93,11 +94,11 @@ export function AiInsightsPanel({
     setCopied(false);
 
     try {
-      const result = await invoke<string>("generate_ai_insight", {
+      const result = await api.generateAiInsight(
         outputDir,
-        templateId: selectedTemplate,
-        customPrompt: customPrompt.trim() ? customPrompt : null,
-      });
+        selectedTemplate,
+        customPrompt.trim() ? customPrompt : null
+      );
       setInsightContent(result);
       setLoading(false);
     } catch (err) {
@@ -126,11 +127,7 @@ export function AiInsightsPanel({
         }
       }
 
-      const answer = await invoke<string>("ask_transcript_ai", {
-        outputDir,
-        question: q,
-        history: formattedHistory,
-      });
+      const answer = await api.askTranscriptAi(outputDir, q, formattedHistory);
 
       setChatMessages([...newHistory, { role: "assistant", content: answer }]);
       setChatLoading(false);
@@ -153,7 +150,7 @@ export function AiInsightsPanel({
 
   const openInFinder = async () => {
     try {
-      await invoke("open_in_finder", { path: outputDir });
+      await api.openInFinder(outputDir);
     } catch (err) {
       setError(String(err));
     }

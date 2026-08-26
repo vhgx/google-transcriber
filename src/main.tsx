@@ -1,11 +1,9 @@
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
-import { open } from "@tauri-apps/plugin-dialog";
 import { useEffect, useMemo, useState, DragEvent } from "react";
 import { createRoot } from "react-dom/client";
 import { AiInsightsPanel } from "./components/AiInsightsPanel";
 import { AudioPlayerSync } from "./components/AudioPlayerSync";
 import { AudioRecorderModal } from "./components/AudioRecorderModal";
+import { api, isTauri } from "./services/api";
 import type {
   AiPreferences,
   AiProvider,
@@ -96,11 +94,11 @@ function App() {
   const refreshAll = async () => {
     try {
       const [loadedPrefs, loadedDiag, loadedBatch, loadedHistory, loadedModels] = await Promise.all([
-        invoke<Preferences>("get_preferences"),
-        invoke<Diagnostic>("diagnose"),
-        invoke<Batch | null>("get_batch"),
-        invoke<HistoryEntry[]>("get_history").catch(() => []),
-        invoke<WhisperModelInfo[]>("list_whisper_models").catch(() => []),
+        api.getPreferences(),
+        api.diagnose(),
+        api.getBatch(),
+        api.getHistory().catch(() => []),
+        api.listWhisperModels().catch(() => []),
       ]);
       setPrefs(loadedPrefs);
       setDiagnostic(loadedDiag);
@@ -110,7 +108,7 @@ function App() {
 
       // Checar Ollama se for o provedor ativo
       if (loadedPrefs.ai?.provider === "ollama") {
-        invoke<string[]>("check_ollama", { endpoint: loadedPrefs.ai.ollama_endpoint })
+        api.checkOllama(loadedPrefs.ai.ollama_endpoint)
           .then((m) => setOllamaModels(m))
           .catch(() => {});
       }
@@ -122,32 +120,25 @@ function App() {
   useEffect(() => {
     refreshAll().catch((error) => setMessage(String(error)));
 
-    let unlistenBatch: (() => void) | undefined;
-    listen<Batch>("batch-state", (event) => {
-      setBatch(event.payload);
-      invoke<HistoryEntry[]>("get_history")
-        .then((h) => setHistory(h))
-        .catch(() => {});
-    }).then((stop) => {
-      unlistenBatch = stop;
-    });
-
-    let unlistenModelProgress: (() => void) | undefined;
-    listen<ModelDownloadProgress>("model-download-progress", (event) => {
-      const p = event.payload;
-      setDownloadProgress((prev) => ({ ...prev, [p.model_id]: p }));
-      if (p.status === "completed" || p.status === "error") {
-        invoke<WhisperModelInfo[]>("list_whisper_models")
-          .then((m) => setModels(m))
+    const unsubscribe = api.subscribeEvents(
+      (newBatch) => {
+        setBatch(newBatch);
+        api.getHistory()
+          .then((h) => setHistory(h))
           .catch(() => {});
+      },
+      (p) => {
+        setDownloadProgress((prev) => ({ ...prev, [p.model_id]: p }));
+        if (p.status === "completed" || p.status === "error") {
+          api.listWhisperModels()
+            .then((m) => setModels(m))
+            .catch(() => {});
+        }
       }
-    }).then((stop) => {
-      unlistenModelProgress = stop;
-    });
+    );
 
     return () => {
-      unlistenBatch?.();
-      unlistenModelProgress?.();
+      unsubscribe();
     };
   }, []);
 
@@ -185,9 +176,7 @@ function App() {
     setCheckingOllama(true);
     setOllamaStatusMsg(null);
     try {
-      const detected = await invoke<string[]>("check_ollama", {
-        endpoint: prefs.ai?.ollama_endpoint,
-      });
+      const detected = await api.checkOllama(prefs.ai?.ollama_endpoint);
       setOllamaModels(detected);
       setOllamaStatusMsg(`✓ Conectado! ${detected.length} modelo(s) encontrado(s).`);
       if (detected.length > 0 && prefs.ai && !detected.includes(prefs.ai.ollama_model)) {
@@ -206,12 +195,12 @@ function App() {
   async function start() {
     setMessage(null);
     try {
-      const created = await invoke<Batch>("create_batch", {
-        urls: urls.split(/\r?\n/),
-        files,
-      });
+      const created = await api.createBatch(
+        urls.split(/\r?\n/).filter(Boolean),
+        files
+      );
       setBatch(created);
-      await invoke("start_batch");
+      await api.startBatch();
     } catch (error) {
       setMessage(String(error));
     }
@@ -219,19 +208,20 @@ function App() {
 
   async function selectFiles() {
     try {
-      const selected = await open({
-        multiple: true,
-        directory: false,
-        filters: [
-          {
-            name: "Vídeo e áudio",
-            extensions: SUPPORTED_EXTENSIONS,
-          },
-        ],
-      });
-      if (!selected) return;
-      const paths = Array.isArray(selected) ? selected : [selected];
-      setFiles((current) => [...new Set([...current, ...paths])]);
+      if (isTauri()) {
+        const selected = await api.selectLocalFiles(SUPPORTED_EXTENSIONS);
+        if (!selected || selected.length === 0) return;
+        const paths = selected as string[];
+        setFiles((current) => [...new Set([...current, ...paths])]);
+      } else {
+        const selected = await api.selectLocalFiles(SUPPORTED_EXTENSIONS);
+        if (!selected || selected.length === 0) return;
+        const fileList = selected as File[];
+        setMessage("Fazendo upload dos arquivos para o servidor...");
+        const uploadedPaths = await api.uploadFiles(fileList);
+        setMessage(null);
+        setFiles((current) => [...new Set([...current, ...uploadedPaths])]);
+      }
     } catch (error) {
       setMessage(String(error));
     }
@@ -250,25 +240,40 @@ function App() {
     setIsDraggingOver(false);
   };
 
-  const handleDrop = (e: DragEvent) => {
+  const handleDrop = async (e: DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
     setIsDraggingOver(false);
 
     if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      const validFiles: File[] = [];
       const droppedPaths: string[] = [];
+
       for (let i = 0; i < e.dataTransfer.files.length; i++) {
         const file = e.dataTransfer.files[i];
-        const path = (file as unknown as { path?: string }).path || file.name;
-        const ext = path.split(".").pop()?.toLowerCase();
+        const ext = file.name.split(".").pop()?.toLowerCase();
         if (ext && SUPPORTED_EXTENSIONS.includes(ext)) {
-          droppedPaths.push(path);
+          validFiles.push(file);
+          const p = (file as unknown as { path?: string }).path;
+          if (p) droppedPaths.push(p);
         }
       }
-      if (droppedPaths.length > 0) {
+
+      if (isTauri() && droppedPaths.length > 0) {
         setFiles((current) => [...new Set([...current, ...droppedPaths])]);
         setActiveTab("composer");
         return;
+      } else if (validFiles.length > 0) {
+        try {
+          setMessage("Fazendo upload dos arquivos arrastados...");
+          const uploaded = await api.uploadFiles(validFiles);
+          setMessage(null);
+          setFiles((current) => [...new Set([...current, ...uploaded])]);
+          setActiveTab("composer");
+          return;
+        } catch (err) {
+          setMessage(`Erro no upload: ${err}`);
+        }
       }
     }
 
@@ -281,7 +286,7 @@ function App() {
 
   async function cancel() {
     try {
-      await invoke("cancel_batch");
+      await api.cancelBatch();
     } catch (error) {
       setMessage(String(error));
     }
@@ -290,10 +295,10 @@ function App() {
   async function savePrefs() {
     if (!prefs) return;
     try {
-      const saved = await invoke<Preferences>("update_preferences", { preferences: prefs });
+      const saved = await api.updatePreferences(prefs);
       setPrefs(saved);
-      setDiagnostic(await invoke<Diagnostic>("diagnose"));
-      const updatedModels = await invoke<WhisperModelInfo[]>("list_whisper_models");
+      setDiagnostic(await api.diagnose());
+      const updatedModels = await api.listWhisperModels();
       setModels(updatedModels);
       setShowSettings(false);
     } catch (error) {
@@ -307,17 +312,13 @@ function App() {
     extensions?: string[]
   ) {
     try {
-      const selected = await open({
-        multiple: false,
-        directory: false,
-        title,
-        filters: extensions ? [{ name: "Arquivos suportados", extensions }] : undefined,
-      });
-      if (selected && typeof selected === "string") {
+      const current = prefs ? (prefs[field] as string) : "";
+      const selected = await api.browseFile(title, extensions, current);
+      if (selected) {
         setPrefs((p) => (p ? { ...p, [field]: selected } : p));
         if (field === "model_path") {
           setTimeout(async () => {
-            const m = await invoke<WhisperModelInfo[]>("list_whisper_models");
+            const m = await api.listWhisperModels();
             setModels(m);
           }, 100);
         }
@@ -329,12 +330,9 @@ function App() {
 
   async function browseDirectory(field: "output_dir", title: string) {
     try {
-      const selected = await open({
-        multiple: false,
-        directory: true,
-        title,
-      });
-      if (selected && typeof selected === "string") {
+      const current = prefs ? (prefs[field] as string) : "";
+      const selected = await api.browseDirectory(title, current);
+      if (selected) {
         setPrefs((p) => (p ? { ...p, [field]: selected } : p));
       }
     } catch (error) {
@@ -356,9 +354,7 @@ function App() {
     });
     setViewerCopied(false);
     try {
-      const bundle = await invoke<TranscriptBundle>("read_transcript_bundle", {
-        outputDir: target.output_dir,
-      });
+      const bundle = await api.readTranscriptBundle(target.output_dir);
       const parsedSegments = bundle.srt ? parseSrtSegments(bundle.srt) : [];
       setViewing({
         target,
@@ -400,15 +396,13 @@ function App() {
         finalTxt = viewing.segments.map((s) => s.text).join("\n\n");
       }
 
-      await invoke("save_transcript_edits", {
-        outputDir: viewing.target.output_dir,
-        txt: finalTxt,
-        srt: finalSrt,
-      });
+      await api.saveTranscriptEdits(
+        viewing.target.output_dir,
+        finalTxt,
+        finalSrt
+      );
 
-      const updatedBundle = await invoke<TranscriptBundle>("read_transcript_bundle", {
-        outputDir: viewing.target.output_dir,
-      });
+      const updatedBundle = await api.readTranscriptBundle(viewing.target.output_dir);
       const updatedSegments = updatedBundle.srt ? parseSrtSegments(updatedBundle.srt) : viewing.segments;
 
       setViewing((v) =>
@@ -425,7 +419,7 @@ function App() {
           : v
       );
 
-      const updatedHistory = await invoke<HistoryEntry[]>("get_history");
+      const updatedHistory = await api.getHistory();
       setHistory(updatedHistory);
 
       setTimeout(() => {
@@ -439,7 +433,7 @@ function App() {
 
   async function copyTranscript(outputDir: string, id: string) {
     try {
-      const text = await invoke<string>("read_transcript", { outputDir });
+      const text = await api.readTranscript(outputDir);
       await navigator.clipboard.writeText(text);
       setCopiedId(id);
       setTimeout(() => setCopiedId(null), 2200);
@@ -450,7 +444,7 @@ function App() {
 
   async function openInFinder(path: string) {
     try {
-      await invoke("open_in_finder", { path });
+      await api.openInFinder(path);
     } catch (error) {
       setMessage(String(error));
     }
@@ -458,8 +452,8 @@ function App() {
 
   async function deleteHistoryItem(id: string) {
     try {
-      await invoke("delete_history_item", { id });
-      const updated = await invoke<HistoryEntry[]>("get_history");
+      await api.deleteHistoryItem(id);
+      const updated = await api.getHistory();
       setHistory(updated);
     } catch (error) {
       setMessage(String(error));
@@ -469,7 +463,7 @@ function App() {
   async function clearAllHistory() {
     if (!confirm("Deseja realmente limpar todo o histórico de transcrições?")) return;
     try {
-      await invoke("clear_history");
+      await api.clearHistory();
       setHistory([]);
     } catch (error) {
       setMessage(String(error));
@@ -478,7 +472,7 @@ function App() {
 
   async function downloadModel(modelId: string) {
     try {
-      await invoke("download_whisper_model", { modelId });
+      await api.downloadWhisperModel(modelId);
     } catch (error) {
       setMessage(String(error));
     }
@@ -486,7 +480,7 @@ function App() {
 
   async function cancelDownloadModel(modelId: string) {
     try {
-      await invoke("cancel_model_download", { modelId });
+      await api.cancelModelDownload(modelId);
       setDownloadProgress((prev) => {
         const next = { ...prev };
         delete next[modelId];
@@ -499,11 +493,11 @@ function App() {
 
   async function activateModel(modelPath: string) {
     try {
-      const updated = await invoke<Preferences>("set_active_model", { modelPath });
+      const updated = await api.setActiveModel(modelPath);
       setPrefs(updated);
-      const updatedModels = await invoke<WhisperModelInfo[]>("list_whisper_models");
+      const updatedModels = await api.listWhisperModels();
       setModels(updatedModels);
-      setDiagnostic(await invoke<Diagnostic>("diagnose"));
+      setDiagnostic(await api.diagnose());
     } catch (error) {
       setMessage(String(error));
     }

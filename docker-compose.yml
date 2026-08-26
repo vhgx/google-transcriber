@@ -1,0 +1,19 @@
+services:
+  yt-txt:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: yt-txt
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data/models:/data/models
+      - ./data/downloads:/data/downloads
+      - ./data/config:/data/config
+    environment:
+      - PORT=3000
+      - DATA_DIR=/data
+      - OLLAMA_ENDPOINT=http://host.docker.internal:11434
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

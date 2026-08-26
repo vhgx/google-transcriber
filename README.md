@@ -44,14 +44,40 @@ O aplicativo detecta automaticamente estes caminhos padrão (Homebrew):
 - `/opt/homebrew/bin/whisper-cli`
 - `~/whisper-models/ggml-medium.bin`
 
-## Executar em desenvolvimento
+## 🐳 Executar via Docker (Modo Web)
+
+Você pode rodar toda a aplicação conteinerizada no Docker (com `ffmpeg`, `yt-dlp` e `whisper-cli` embutidos):
+
+```sh
+docker compose up -d --build
+```
+
+Acesse no navegador: **`http://localhost:3000`**
+
+### Volumes e Persistência:
+- `./data/models`: armazena os modelos GGML do Whisper baixados.
+- `./data/downloads`: armazena as mídias, áudios e transcrições geradas.
+- `./data/config`: armazena as preferências e o histórico.
+
+---
+
+## 🖥️ Executar Servidor Web Localmente (Sem Docker)
+
+```sh
+npm run build
+npm run server
+```
+
+---
+
+## 🍎 Executar como App Desktop macOS (Tauri)
 
 ```sh
 npm install
 npm run tauri dev
 ```
 
-Para criar o app macOS (.app / .dmg):
+Para gerar o instalador macOS (.app / .dmg):
 
 ```sh
 npm run tauri build
@@ -63,6 +89,7 @@ O bundle será gerado em `src-tauri/target/release/bundle/macos/Transcrições l
 
 ```sh
 npm run build
+PATH="/opt/homebrew/opt/rust/bin:$PATH" cargo check --manifest-path src-server/Cargo.toml
 PATH="/opt/homebrew/opt/rust/bin:$PATH" cargo test --manifest-path src-tauri/Cargo.toml
 ```
 

@@ -1,0 +1,10 @@
+node_modules
+dist
+target
+src-tauri/target
+src-server/target
+.git
+.gitignore
+.DS_Store
+*.log
+data
