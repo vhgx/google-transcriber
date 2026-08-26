@@ -17,6 +17,7 @@ export function AudioRecorderModal({
   const [seconds, setSeconds] = useState(0);
   const [error, setError] = useState<string | null>(null);
 
+  const modeRef = useRef<"web" | "native" | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const timerRef = useRef<number | null>(null);
@@ -42,6 +43,9 @@ export function AudioRecorderModal({
       cancelAnimationFrame(animationFrameRef.current);
       animationFrameRef.current = null;
     }
+    if (modeRef.current === "native") {
+      invoke("cancel_native_recording").catch(() => {});
+    }
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
       mediaRecorderRef.current.stop();
     }
@@ -53,14 +57,53 @@ export function AudioRecorderModal({
       audioContextRef.current.close().catch(() => {});
       audioContextRef.current = null;
     }
+    modeRef.current = null;
     setRecordingState("idle");
     setSeconds(0);
     setError(null);
     audioChunksRef.current = [];
   };
 
+  const drawSyntheticWaveform = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    let phase = 0;
+    const barsCount = 32;
+
+    const render = () => {
+      animationFrameRef.current = requestAnimationFrame(render);
+      phase += 0.08;
+
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      const barWidth = canvas.width / barsCount;
+
+      for (let i = 0; i < barsCount; i++) {
+        const factor = Math.sin(phase + i * 0.3) * 0.5 + 0.5;
+        const noise = Math.sin(phase * 1.5 + i * 0.7) * 0.3;
+        const heightFactor = Math.max(0.12, Math.min(1, factor + noise));
+        const barHeight = heightFactor * (canvas.height * 0.75);
+
+        const gradient = ctx.createLinearGradient(0, canvas.height, 0, 0);
+        gradient.addColorStop(0, "rgba(16, 185, 129, 0.2)");
+        gradient.addColorStop(0.5, "rgba(43, 201, 173, 0.8)");
+        gradient.addColorStop(1, "rgba(94, 234, 212, 1)");
+
+        ctx.fillStyle = gradient;
+        ctx.fillRect(i * barWidth + 2, (canvas.height - barHeight) / 2, barWidth - 4, barHeight);
+      }
+    };
+
+    render();
+  };
+
   const drawWaveform = () => {
-    if (!analyserRef.current || !canvasRef.current) return;
+    if (!analyserRef.current || !canvasRef.current) {
+      drawSyntheticWaveform();
+      return;
+    }
     const canvas = canvasRef.current;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
@@ -82,7 +125,6 @@ export function AudioRecorderModal({
       for (let i = 0; i < bufferLength; i++) {
         const barHeight = (dataArray[i] / 255) * (canvas.height * 0.85);
 
-        // Gradiente vibrante esmeralda / turquesa
         const gradient = ctx.createLinearGradient(0, canvas.height, 0, 0);
         gradient.addColorStop(0, "rgba(16, 185, 129, 0.2)");
         gradient.addColorStop(0.5, "rgba(43, 201, 173, 0.8)");
@@ -102,30 +144,56 @@ export function AudioRecorderModal({
     setError(null);
     audioChunksRef.current = [];
 
+    // 1. Tenta usar Web MediaRecorder se disponível no navegador/webview
+    if (
+      typeof navigator !== "undefined" &&
+      navigator.mediaDevices &&
+      typeof navigator.mediaDevices.getUserMedia === "function"
+    ) {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        streamRef.current = stream;
+        modeRef.current = "web";
+
+        const audioCtx = new (window.AudioContext ||
+          (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
+        audioContextRef.current = audioCtx;
+
+        const analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 128;
+        analyserRef.current = analyser;
+
+        const source = audioCtx.createMediaStreamSource(stream);
+        source.connect(analyser);
+
+        const recorder = new MediaRecorder(stream);
+        mediaRecorderRef.current = recorder;
+
+        recorder.ondataavailable = (event) => {
+          if (event.data.size > 0) {
+            audioChunksRef.current.push(event.data);
+          }
+        };
+
+        recorder.start(250);
+        setRecordingState("recording");
+
+        setSeconds(0);
+        timerRef.current = window.setInterval(() => {
+          setSeconds((prev) => prev + 1);
+        }, 1000);
+
+        drawWaveform();
+        return;
+      } catch (e) {
+        console.warn("MediaDevices do Webview indisponível, usando gravador nativo do sistema:", e);
+      }
+    }
+
+    // 2. Fallback nativo: grava diretamente pelo FFmpeg/AVFoundation no backend Rust
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current = stream;
-
-      const audioCtx = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
-      audioContextRef.current = audioCtx;
-
-      const analyser = audioCtx.createAnalyser();
-      analyser.fftSize = 128;
-      analyserRef.current = analyser;
-
-      const source = audioCtx.createMediaStreamSource(stream);
-      source.connect(analyser);
-
-      const recorder = new MediaRecorder(stream);
-      mediaRecorderRef.current = recorder;
-
-      recorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          audioChunksRef.current.push(event.data);
-        }
-      };
-
-      recorder.start(250);
+      modeRef.current = "native";
+      await invoke("start_native_recording");
       setRecordingState("recording");
 
       setSeconds(0);
@@ -133,42 +201,56 @@ export function AudioRecorderModal({
         setSeconds((prev) => prev + 1);
       }, 1000);
 
-      drawWaveform();
+      drawSyntheticWaveform();
     } catch (err) {
-      setError(`Não foi possível acessar o microfone: ${err}`);
+      modeRef.current = null;
+      setError(`Não foi possível iniciar a gravação de áudio: ${err}`);
       setRecordingState("idle");
     }
   };
 
   const pauseRecording = () => {
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state === "recording") {
+    if (modeRef.current === "web" && mediaRecorderRef.current && mediaRecorderRef.current.state === "recording") {
       mediaRecorderRef.current.pause();
-      setRecordingState("paused");
-      if (timerRef.current) {
-        clearInterval(timerRef.current);
-        timerRef.current = null;
-      }
+    }
+    setRecordingState("paused");
+    if (timerRef.current) {
+      clearInterval(timerRef.current);
+      timerRef.current = null;
     }
   };
 
   const resumeRecording = () => {
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state === "paused") {
+    if (modeRef.current === "web" && mediaRecorderRef.current && mediaRecorderRef.current.state === "paused") {
       mediaRecorderRef.current.resume();
-      setRecordingState("recording");
-      timerRef.current = window.setInterval(() => {
-        setSeconds((prev) => prev + 1);
-      }, 1000);
     }
+    setRecordingState("recording");
+    timerRef.current = window.setInterval(() => {
+      setSeconds((prev) => prev + 1);
+    }, 1000);
   };
 
   const finishRecording = async () => {
-    if (!mediaRecorderRef.current) return;
-
     setRecordingState("saving");
     if (timerRef.current) {
       clearInterval(timerRef.current);
       timerRef.current = null;
     }
+
+    if (modeRef.current === "native") {
+      try {
+        const savedPath = await invoke<string>("stop_native_recording");
+        cleanup();
+        onRecordingComplete(savedPath);
+        onClose();
+      } catch (err) {
+        setError(`Erro ao finalizar gravação nativa: ${err}`);
+        setRecordingState("paused");
+      }
+      return;
+    }
+
+    if (!mediaRecorderRef.current) return;
 
     mediaRecorderRef.current.onstop = async () => {
       try {

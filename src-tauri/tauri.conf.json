@@ -26,6 +26,10 @@
     "active": true,
     "icon": ["icons/icon.icns", "icons/icon.png"],
     "targets": ["app"],
-    "macOS": { "minimumSystemVersion": "12.0" }
+    "macOS": {
+      "minimumSystemVersion": "12.0",
+      "entitlements": "Entitlements.plist",
+      "infoPlist": "Info.plist"
+    }
   }
 }

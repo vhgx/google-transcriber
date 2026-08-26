@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>O Transcrições locais precisa de acesso ao microfone para gravar áudios e reuniões para transcrição.</string>
+    <key>NSCameraUsageDescription</key>
+    <string>O Transcrições locais precisa de permissão para gravação de mídia.</string>
+</dict>
+</plist>

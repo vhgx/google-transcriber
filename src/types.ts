@@ -14,15 +14,22 @@ export type SourceKind =
   | "video_file"
   | "audio_file";
 
-export type TranscriptFormat = "sync" | "txt" | "srt" | "vtt" | "md" | "json";
+export type TranscriptFormat = "sync" | "txt" | "srt" | "vtt" | "md" | "json" | "ai";
 
-export interface TranscriptSegment {
-  id: number;
-  start: number; // em segundos
-  end: number;   // em segundos
-  startFormatted: string;
-  endFormatted: string;
-  text: string;
+export type AiProvider = "ollama" | "gemini" | "openai" | "groq";
+
+export type AiTemplateId = "summary" | "actions" | "chapters" | "clean" | "chat";
+
+export interface AiPreferences {
+  provider: AiProvider;
+  ollama_endpoint: string;
+  ollama_model: string;
+  gemini_api_key: string;
+  gemini_model: string;
+  openai_api_key: string;
+  openai_model: string;
+  groq_api_key: string;
+  groq_model: string;
 }
 
 export interface Preferences {
@@ -32,6 +39,7 @@ export interface Preferences {
   model_path: string;
   output_dir: string;
   concurrency: number;
+  ai?: AiPreferences;
 }
 
 export interface Check {
@@ -43,6 +51,15 @@ export interface Check {
 
 export interface Diagnostic {
   checks: Check[];
+}
+
+export interface TranscriptSegment {
+  id: number;
+  start: number; // em segundos
+  end: number;   // em segundos
+  startFormatted: string;
+  endFormatted: string;
+  text: string;
 }
 
 export interface BatchItem {
@@ -113,4 +130,17 @@ export interface HistoryEntry {
   preview_text: string;
   model_name: string;
   formats: string[];
+}
+
+export interface ChatMessage {
+  role: "user" | "assistant";
+  content: string;
+  timestamp?: string;
+}
+
+export interface SavedInsight {
+  id: string;
+  title: string;
+  content: string;
+  filename: string;
 }

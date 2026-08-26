@@ -1,7 +1,7 @@
 use chrono::Local;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::{
     collections::HashSet,
     fs,
@@ -19,6 +19,35 @@ use url::Url;
 use uuid::Uuid;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AiPreferences {
+    pub provider: String,
+    pub ollama_endpoint: String,
+    pub ollama_model: String,
+    pub gemini_api_key: String,
+    pub gemini_model: String,
+    pub openai_api_key: String,
+    pub openai_model: String,
+    pub groq_api_key: String,
+    pub groq_model: String,
+}
+
+impl Default for AiPreferences {
+    fn default() -> Self {
+        Self {
+            provider: "ollama".into(),
+            ollama_endpoint: "http://127.0.0.1:11434".into(),
+            ollama_model: "llama3.2:latest".into(),
+            gemini_api_key: "".into(),
+            gemini_model: "gemini-3.7-flash".into(),
+            openai_api_key: "".into(),
+            openai_model: "gpt-4o-mini".into(),
+            groq_api_key: "".into(),
+            groq_model: "llama-3.3-70b-versatile".into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Preferences {
     pub yt_dlp_path: String,
     pub ffmpeg_path: String,
@@ -26,6 +55,8 @@ pub struct Preferences {
     pub model_path: String,
     pub output_dir: String,
     pub concurrency: u8,
+    #[serde(default)]
+    pub ai: AiPreferences,
 }
 
 impl Default for Preferences {
@@ -38,6 +69,7 @@ impl Default for Preferences {
             model_path: home.join("whisper-models/ggml-medium.bin").to_string_lossy().into(),
             output_dir: home.join("Downloads/Transcrições").to_string_lossy().into(),
             concurrency: 1,
+            ai: AiPreferences::default(),
         }
     }
 }
@@ -235,12 +267,18 @@ pub struct HistoryEntry {
     pub formats: Vec<String>,
 }
 
+struct ActiveRecording {
+    child: std::process::Child,
+    output_path: PathBuf,
+}
+
 pub struct AppState {
     preferences: Mutex<Preferences>,
     batch: Mutex<Option<Batch>>,
     cancelled: AtomicBool,
     running_pids: Mutex<HashSet<u32>>,
     active_downloads: Mutex<HashSet<String>>,
+    active_recording: Mutex<Option<ActiveRecording>>,
     config_path: PathBuf,
     history_path: PathBuf,
 }
@@ -252,10 +290,21 @@ fn lock<T>(mutex: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>, String> {
 }
 
 fn load_preferences(path: &Path) -> Preferences {
-    fs::read_to_string(path)
+    let mut prefs: Preferences = fs::read_to_string(path)
         .ok()
         .and_then(|json| serde_json::from_str(&json).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let current = prefs.ai.gemini_model.trim();
+    if current.is_empty()
+        || current == "gemini-1.5-flash"
+        || current == "gemini-2.0-flash"
+        || current == "gemini-2.5-flash"
+    {
+        prefs.ai.gemini_model = "gemini-3.7-flash".to_string();
+    } else if current == "gemini-1.5-pro" || current == "gemini-2.5-pro" {
+        prefs.ai.gemini_model = "gemini-3.1-pro-preview".to_string();
+    }
+    prefs
 }
 
 fn persist_preferences(path: &Path, preferences: &Preferences) -> Result<(), String> {
@@ -438,6 +487,383 @@ fn generate_markdown_transcript(
 
     md
 }
+
+// -------------------------------------------------------------
+// MOTOR DE IA / LLM (Ollama, Gemini, OpenAI, Groq)
+// -------------------------------------------------------------
+
+async fn execute_llm_request(
+    ai_prefs: &AiPreferences,
+    system_prompt: &str,
+    user_prompt: &str,
+) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| format!("Erro ao criar cliente HTTP: {e}"))?;
+
+    match ai_prefs.provider.as_str() {
+        "ollama" => {
+            let endpoint = ai_prefs.ollama_endpoint.trim_end_matches('/');
+            let url = format!("{endpoint}/api/generate");
+            let body = json!({
+                "model": ai_prefs.ollama_model,
+                "system": system_prompt,
+                "prompt": user_prompt,
+                "stream": false,
+            });
+
+            let res = client
+                .post(&url)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| format!("Não foi possível conectar ao Ollama ({url}). Verifique se o app Ollama está aberto. Detalhes: {e}"))?;
+
+            if !res.status().is_success() {
+                let status = res.status();
+                let err_text = res.text().await.unwrap_or_default();
+                return Err(format!("Ollama retornou erro (HTTP {status}): {err_text}"));
+            }
+
+            let val = res
+                .json::<Value>()
+                .await
+                .map_err(|e| format!("Erro ao decodificar JSON do Ollama: {e}"))?;
+
+            let answer = val.get("response").and_then(Value::as_str).unwrap_or("");
+            if answer.trim().is_empty() {
+                return Err("Ollama retornou uma resposta vazia.".into());
+            }
+            Ok(answer.to_string())
+        }
+        "gemini" => {
+            if ai_prefs.gemini_api_key.trim().is_empty() {
+                return Err("Chave de API do Google Gemini não configurada. Insira em Configurações > Inteligência IA.".into());
+            }
+            let raw_model = ai_prefs.gemini_model.trim();
+            let model = match raw_model {
+                "" | "gemini-1.5-flash" | "gemini-2.0-flash" | "gemini-2.5-flash" => "gemini-3.7-flash",
+                "gemini-1.5-pro" | "gemini-2.5-pro" => "gemini-3.1-pro-preview",
+                other => other,
+            };
+            let url = format!(
+                "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={}",
+                ai_prefs.gemini_api_key.trim()
+            );
+
+            let body = json!({
+                "systemInstruction": {
+                    "parts": [{ "text": system_prompt }]
+                },
+                "contents": [
+                    {
+                        "parts": [{ "text": user_prompt }]
+                    }
+                ]
+            });
+
+            let res = client
+                .post(&url)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| format!("Erro ao conectar com API do Google Gemini: {e}"))?;
+
+            if !res.status().is_success() {
+                let status = res.status();
+                let err_text = res.text().await.unwrap_or_default();
+                return Err(format!("Google Gemini retornou erro (HTTP {status}): {err_text}"));
+            }
+
+            let val = res
+                .json::<Value>()
+                .await
+                .map_err(|e| format!("Erro ao decodificar resposta do Gemini: {e}"))?;
+
+            let text = val
+                .get("candidates")
+                .and_then(|c| c.get(0))
+                .and_then(|c| c.get("content"))
+                .and_then(|c| c.get("parts"))
+                .and_then(|p| p.get(0))
+                .and_then(|p| p.get("text"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+
+            if text.trim().is_empty() {
+                return Err("Gemini retornou uma resposta vazia.".into());
+            }
+            Ok(text.to_string())
+        }
+        "openai" | "groq" => {
+            let is_groq = ai_prefs.provider == "groq";
+            let (api_key, model, url) = if is_groq {
+                (
+                    &ai_prefs.groq_api_key,
+                    if ai_prefs.groq_model.trim().is_empty() {
+                        "llama-3.3-70b-versatile"
+                    } else {
+                        &ai_prefs.groq_model
+                    },
+                    "https://api.groq.com/openai/v1/chat/completions",
+                )
+            } else {
+                (
+                    &ai_prefs.openai_api_key,
+                    if ai_prefs.openai_model.trim().is_empty() {
+                        "gpt-4o-mini"
+                    } else {
+                        &ai_prefs.openai_model
+                    },
+                    "https://api.openai.com/v1/chat/completions",
+                )
+            };
+
+            if api_key.trim().is_empty() {
+                let name = if is_groq { "Groq" } else { "OpenAI" };
+                return Err(format!("Chave de API do {name} não configurada. Insira em Configurações > Inteligência IA."));
+            }
+
+            let body = json!({
+                "model": model,
+                "messages": [
+                    { "role": "system", "content": system_prompt },
+                    { "role": "user", "content": user_prompt }
+                ],
+                "temperature": 0.3
+            });
+
+            let res = client
+                .post(url)
+                .bearer_auth(api_key.trim())
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| format!("Erro ao conectar com a API: {e}"))?;
+
+            if !res.status().is_success() {
+                let status = res.status();
+                let err_text = res.text().await.unwrap_or_default();
+                return Err(format!("API retornou erro (HTTP {status}): {err_text}"));
+            }
+
+            let val = res
+                .json::<Value>()
+                .await
+                .map_err(|e| format!("Erro ao decodificar JSON: {e}"))?;
+
+            let text = val
+                .get("choices")
+                .and_then(|c| c.get(0))
+                .and_then(|c| c.get("message"))
+                .and_then(|m| m.get("content"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+
+            if text.trim().is_empty() {
+                return Err("A IA retornou uma resposta vazia.".into());
+            }
+            Ok(text.to_string())
+        }
+        _ => Err(format!("Provedor de IA desconhecido: {}", ai_prefs.provider)),
+    }
+}
+
+#[tauri::command]
+async fn check_ollama(endpoint: Option<String>) -> Result<Vec<String>, String> {
+    let raw_endpoint = endpoint.unwrap_or_else(|| "http://127.0.0.1:11434".into());
+    let url = format!("{}/api/tags", raw_endpoint.trim_end_matches('/'));
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|e| format!("Erro HTTP: {e}"))?;
+
+    let res = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("Ollama não está respondendo em {raw_endpoint}: {e}"))?;
+
+    if !res.status().is_success() {
+        return Err(format!("Ollama retornou status HTTP {}", res.status()));
+    }
+
+    let val = res
+        .json::<Value>()
+        .await
+        .map_err(|e| format!("Erro ao decodificar lista de modelos Ollama: {e}"))?;
+
+    let mut models = Vec::new();
+    if let Some(arr) = val.get("models").and_then(Value::as_array) {
+        for m in arr {
+            if let Some(name) = m.get("name").and_then(Value::as_str) {
+                models.push(name.to_string());
+            }
+        }
+    }
+
+    Ok(models)
+}
+
+#[tauri::command]
+async fn generate_ai_insight(
+    output_dir: String,
+    template_id: String,
+    custom_prompt: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let dir = PathBuf::from(&output_dir);
+    if !dir.is_dir() {
+        return Err(format!("Pasta de saída não encontrada: {output_dir}"));
+    }
+
+    let txt_path = dir.join("transcricao.txt");
+    if !txt_path.is_file() {
+        return Err("Arquivo transcricao.txt não encontrado para análise.".into());
+    }
+
+    let transcript_text = fs::read_to_string(&txt_path)
+        .map_err(|e| format!("Não foi possível ler transcricao.txt: {e}"))?;
+
+    let srt_text = fs::read_to_string(dir.join("transcricao.srt")).unwrap_or_default();
+
+    let ai_prefs = lock(&state.preferences)?.ai.clone();
+
+    let (system_prompt, user_prompt, save_filename) = match template_id.as_str() {
+        "summary" => (
+            "Você é um assistente executivo e analista sênior de conteúdo em língua portuguesa.".to_string(),
+            format!(
+                "Gere um Resumo Executivo estruturado e elegante em Markdown da transcrição a seguir.\n\n\
+                Estrutura recomendada:\n\
+                # 📝 Resumo Executivo\n\
+                ## 📌 Visão Geral & Contexto\n\
+                ## 💡 Principais Tópicos & Ideias Centrais\n\
+                ## 🎯 Conclusões & Pontos Relevantes\n\n\
+                Transcrição:\n\n{transcript_text}"
+            ),
+            "resumo.md",
+        ),
+        "actions" => (
+            "Você é um especialista em produtividade, gestão de projetos e reuniões em língua portuguesa.".to_string(),
+            format!(
+                "Analise a transcrição a seguir e extraia um Plano de Ação & Lista de Decisões em formato Markdown.\n\n\
+                Estrutura recomendada:\n\
+                # 🎯 Plano de Ação & Tarefas\n\
+                ## ✅ Decisões Tomadas\n\
+                ## 📋 Tarefas & Próximos Passos (use `- [ ]`)\n\
+                ## 👥 Responsáveis & Prazos Mencionados\n\n\
+                Transcrição:\n\n{transcript_text}"
+            ),
+            "tarefas.md",
+        ),
+        "chapters" => (
+            "Você é um especialista em estruturação de vídeos para YouTube e Podcasts em língua portuguesa.".to_string(),
+            format!(
+                "Com base nas legendas com timestamps SRT a seguir, gere uma lista de Capítulos para a descrição do YouTube no formato cronológico `00:00 Nome do Capítulo`.\n\n\
+                Estrutura recomendada:\n\
+                # 📑 Capítulos do YouTube & Podcasts\n\n\
+                ## ⏱️ Minutagem (Timestamps)\n\
+                (Lista de timestamps ex: `00:00 Introdução`)\n\n\
+                ## 📖 Resumo por Capítulo\n\
+                (Breve explicação de 1 a 2 frases sobre cada capítulo)\n\n\
+                Legendas SRT:\n\n{}",
+                if !srt_text.trim().is_empty() { &srt_text } else { &transcript_text }
+            ),
+            "capitulos.md",
+        ),
+        "clean" => (
+            "Você é um editor de texto e revisor gramatical de alto nível em português brasileiro.".to_string(),
+            format!(
+                "Transforme a transcrição falada a seguir em um texto limpo, coeso e agradável no formato de Artigo/Ata editorial em Markdown.\n\
+                Elimine repetições, hesitações ('humm', 'tipo assim', 'ééé', falsos inícios e vícios de fala), mantendo 100% da fidelidade semântica original e aprimorando a pontuação e fluidez.\n\n\
+                Transcrição original:\n\n{transcript_text}"
+            ),
+            "transcricao_limpa.md",
+        ),
+        "custom" => {
+            let prompt = custom_prompt.unwrap_or_else(|| "Analise e faça uma síntese da transcrição.".into());
+            (
+                "Você é um assistente de IA especialista em análise de transcrições em língua portuguesa.".to_string(),
+                format!("{prompt}\n\nTranscrição:\n\n{transcript_text}"),
+                "analise_personalizada.md",
+            )
+        }
+        _ => return Err(format!("Template de IA não reconhecido: {template_id}")),
+    };
+
+    let result = execute_llm_request(&ai_prefs, &system_prompt, &user_prompt).await?;
+
+    let save_path = dir.join(save_filename);
+    let _ = fs::write(&save_path, &result);
+
+    Ok(result)
+}
+
+#[tauri::command]
+async fn ask_transcript_ai(
+    output_dir: String,
+    question: String,
+    history: Vec<(String, String)>,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let dir = PathBuf::from(&output_dir);
+    let txt_path = dir.join("transcricao.txt");
+    if !txt_path.is_file() {
+        return Err("Arquivo transcricao.txt não encontrado.".into());
+    }
+
+    let transcript_text = fs::read_to_string(&txt_path)
+        .map_err(|e| format!("Não foi possível ler a transcrição: {e}"))?;
+
+    let ai_prefs = lock(&state.preferences)?.ai.clone();
+
+    let system_prompt = format!(
+        "Você é um assistente inteligente e prestativo conversando sobre a seguinte transcrição de áudio/vídeo em português:\n\n\
+        --- INÍCIO DA TRANSCRIÇÃO ---\n\
+        {transcript_text}\n\
+        --- FIM DA TRANSCRIÇÃO ---\n\n\
+        Responda às perguntas do usuário com precisão e clareza, sempre fundamentando suas respostas no conteúdo falado na transcrição acima."
+    );
+
+    let mut context_prompt = String::new();
+    for (user_msg, assistant_msg) in history.iter().rev().take(6).rev() {
+        context_prompt.push_str(&format!("Usuário: {user_msg}\nAssistente: {assistant_msg}\n\n"));
+    }
+    context_prompt.push_str(&format!("Pergunta atual do Usuário: {question}"));
+
+    execute_llm_request(&ai_prefs, &system_prompt, &context_prompt).await
+}
+
+#[tauri::command]
+fn list_saved_insights(output_dir: String) -> Result<Vec<(String, String, String)>, String> {
+    let dir = PathBuf::from(&output_dir);
+    let mut insights = Vec::new();
+
+    let mappings = [
+        ("summary", "Resumo Executivo", "resumo.md"),
+        ("actions", "Plano de Ação & Tarefas", "tarefas.md"),
+        ("chapters", "Capítulos do YouTube", "capitulos.md"),
+        ("clean", "Transcrição Limpa", "transcricao_limpa.md"),
+        ("custom", "Análise Personalizada", "analise_personalizada.md"),
+    ];
+
+    for (id, title, filename) in mappings {
+        let p = dir.join(filename);
+        if p.is_file() {
+            if let Ok(content) = fs::read_to_string(&p) {
+                insights.push((id.to_string(), title.to_string(), content));
+            }
+        }
+    }
+
+    Ok(insights)
+}
+
+// -------------------------------------------------------------
+// COMANDOS TAURI GERAIS
+// -------------------------------------------------------------
 
 #[tauri::command]
 fn get_preferences(state: State<'_, AppState>) -> Result<Preferences, String> {
@@ -883,7 +1309,7 @@ fn read_audio_bytes(output_dir: String) -> Result<Vec<u8>, String> {
             let p = entry.path();
             if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
                 let lower = ext.to_ascii_lowercase();
-                if matches!(lower.as_str(), "mp3" | "m4a" | "wav" | "aac" | "ogg" | "flac" | "opus") {
+                if matches!(lower.as_str(), "mp3" | "m4a" | "wav" | "aac" | "ogg" | "flac" | "opus" | "webm") {
                     return fs::read(&p).map_err(|e| format!("Não foi possível ler áudio: {e}"));
                 }
             }
@@ -959,7 +1385,7 @@ fn save_recorded_audio(
         .map_err(|e| format!("Não foi possível criar a pasta de gravações: {e}"))?;
 
     let safe_name = if filename.trim().is_empty() {
-        format!("gravacao_{}.wav", Local::now().format("%Y-%m-%d_%H-%M-%S"))
+        format!("gravacao_{}.webm", Local::now().format("%Y-%m-%d_%H-%M-%S"))
     } else {
         filename
     };
@@ -969,6 +1395,126 @@ fn save_recorded_audio(
         .map_err(|e| format!("Erro ao gravar áudio do microfone: {e}"))?;
 
     Ok(target.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn start_native_recording(state: State<'_, AppState>) -> Result<String, String> {
+    let mut recording_guard = lock(&state.active_recording)?;
+    if recording_guard.is_some() {
+        return Err("Já existe uma gravação em andamento.".into());
+    }
+
+    let preferences = lock(&state.preferences)?.clone();
+    let recordings_dir = PathBuf::from(preferences.output_dir).join("Gravações");
+    fs::create_dir_all(&recordings_dir)
+        .map_err(|e| format!("Não foi possível criar pasta de gravações: {e}"))?;
+
+    let filename = format!("gravacao_{}.wav", Local::now().format("%Y-%m-%d_%H-%M-%S"));
+    let target = recordings_dir.join(filename);
+
+    let ffmpeg = if preferences.ffmpeg_path.trim().is_empty() {
+        "ffmpeg".to_string()
+    } else {
+        preferences.ffmpeg_path.trim().to_string()
+    };
+
+    #[cfg(target_os = "macos")]
+    let child = std::process::Command::new(&ffmpeg)
+        .args([
+            "-y",
+            "-f",
+            "avfoundation",
+            "-i",
+            ":0",
+            "-acodec",
+            "pcm_s16le",
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            &target.to_string_lossy(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Falha ao iniciar gravação pelo FFmpeg: {e}"))?;
+
+    #[cfg(not(target_os = "macos"))]
+    let child = std::process::Command::new(&ffmpeg)
+        .args([
+            "-y",
+            "-f",
+            "alsa",
+            "-i",
+            "default",
+            "-acodec",
+            "pcm_s16le",
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            &target.to_string_lossy(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Falha ao iniciar gravação pelo FFmpeg: {e}"))?;
+
+    *recording_guard = Some(ActiveRecording {
+        child,
+        output_path: target.clone(),
+    });
+
+    Ok(target.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn stop_native_recording(state: State<'_, AppState>) -> Result<String, String> {
+    let mut recording_guard = lock(&state.active_recording)?;
+    let mut rec = recording_guard
+        .take()
+        .ok_or_else(|| "Nenhuma gravação ativa encontrada.".to_string())?;
+
+    if let Some(mut stdin) = rec.child.stdin.take() {
+        use std::io::Write;
+        let _ = stdin.write_all(b"q\n");
+        let _ = stdin.flush();
+    }
+
+    let mut finished = false;
+    for _ in 0..30 {
+        if let Ok(Some(_)) = rec.child.try_wait() {
+            finished = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    if !finished {
+        let _ = rec.child.kill();
+        let _ = rec.child.wait();
+    }
+
+    if !rec.output_path.exists()
+        || fs::metadata(&rec.output_path).map(|m| m.len()).unwrap_or(0) == 0
+    {
+        return Err("Arquivo de gravação não foi gerado ou está vazio.".into());
+    }
+
+    Ok(rec.output_path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn cancel_native_recording(state: State<'_, AppState>) -> Result<(), String> {
+    let mut recording_guard = lock(&state.active_recording)?;
+    if let Some(mut rec) = recording_guard.take() {
+        let _ = rec.child.kill();
+        let _ = rec.child.wait();
+        let _ = fs::remove_file(&rec.output_path);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1590,6 +2136,7 @@ pub fn run() {
                 cancelled: AtomicBool::new(false),
                 running_pids: Mutex::new(HashSet::new()),
                 active_downloads: Mutex::new(HashSet::new()),
+                active_recording: Mutex::new(None),
                 config_path,
                 history_path,
             });
@@ -1612,6 +2159,13 @@ pub fn run() {
             read_audio_bytes,
             save_transcript_edits,
             save_recorded_audio,
+            start_native_recording,
+            stop_native_recording,
+            cancel_native_recording,
+            check_ollama,
+            generate_ai_insight,
+            ask_transcript_ai,
+            list_saved_insights,
             get_history,
             delete_history_item,
             clear_history,
@@ -1663,6 +2217,7 @@ mod tests {
         let preferences = Preferences::default();
         assert_eq!(preferences.concurrency, 1);
         assert!(preferences.model_path.ends_with("ggml-medium.bin"));
+        assert_eq!(preferences.ai.provider, "ollama");
     }
 
     #[test]

@@ -3,9 +3,12 @@ import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useEffect, useMemo, useState, DragEvent } from "react";
 import { createRoot } from "react-dom/client";
+import { AiInsightsPanel } from "./components/AiInsightsPanel";
 import { AudioPlayerSync } from "./components/AudioPlayerSync";
 import { AudioRecorderModal } from "./components/AudioRecorderModal";
 import type {
+  AiPreferences,
+  AiProvider,
   Batch,
   BatchItem,
   Diagnostic,
@@ -80,6 +83,11 @@ function App() {
   const [showRecorder, setShowRecorder] = useState(false);
   const [isDraggingOver, setIsDraggingOver] = useState(false);
 
+  // Ollama Models Detection State
+  const [ollamaModels, setOllamaModels] = useState<string[]>([]);
+  const [checkingOllama, setCheckingOllama] = useState(false);
+  const [ollamaStatusMsg, setOllamaStatusMsg] = useState<string | null>(null);
+
   const [message, setMessage] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [viewing, setViewing] = useState<ViewerState | null>(null);
@@ -99,6 +107,13 @@ function App() {
       setBatch(loadedBatch);
       setHistory(loadedHistory);
       setModels(loadedModels);
+
+      // Checar Ollama se for o provedor ativo
+      if (loadedPrefs.ai?.provider === "ollama") {
+        invoke<string[]>("check_ollama", { endpoint: loadedPrefs.ai.ollama_endpoint })
+          .then((m) => setOllamaModels(m))
+          .catch(() => {});
+      }
     } catch (error) {
       console.error(error);
     }
@@ -165,6 +180,29 @@ function App() {
     return history.reduce((acc, curr) => acc + (curr.word_count || 0), 0);
   }, [history]);
 
+  async function testOllamaConnection() {
+    if (!prefs) return;
+    setCheckingOllama(true);
+    setOllamaStatusMsg(null);
+    try {
+      const detected = await invoke<string[]>("check_ollama", {
+        endpoint: prefs.ai?.ollama_endpoint,
+      });
+      setOllamaModels(detected);
+      setOllamaStatusMsg(`✓ Conectado! ${detected.length} modelo(s) encontrado(s).`);
+      if (detected.length > 0 && prefs.ai && !detected.includes(prefs.ai.ollama_model)) {
+        setPrefs({
+          ...prefs,
+          ai: { ...prefs.ai, ollama_model: detected[0] },
+        });
+      }
+    } catch (err) {
+      setOllamaStatusMsg(`⚠️ Não foi possível conectar ao Ollama: ${err}`);
+    } finally {
+      setCheckingOllama(false);
+    }
+  }
+
   async function start() {
     setMessage(null);
     try {
@@ -217,12 +255,10 @@ function App() {
     e.stopPropagation();
     setIsDraggingOver(false);
 
-    // Verificar se foram soltos arquivos
     if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
       const droppedPaths: string[] = [];
       for (let i = 0; i < e.dataTransfer.files.length; i++) {
         const file = e.dataTransfer.files[i];
-        // Em apps Tauri, file pode conter path
         const path = (file as unknown as { path?: string }).path || file.name;
         const ext = path.split(".").pop()?.toLowerCase();
         if (ext && SUPPORTED_EXTENSIONS.includes(ext)) {
@@ -236,7 +272,6 @@ function App() {
       }
     }
 
-    // Verificar se foi solto texto/URL
     const textData = e.dataTransfer.getData("text");
     if (textData && textData.trim()) {
       setUrls((curr) => (curr ? `${curr}\n${textData.trim()}` : textData.trim()));
@@ -307,12 +342,12 @@ function App() {
     }
   }
 
-  async function openViewer(target: ViewerTarget) {
+  async function openViewer(target: ViewerTarget, defaultFormat: TranscriptFormat = "sync") {
     setViewing({
       target,
       bundle: null,
       segments: [],
-      selectedFormat: "sync",
+      selectedFormat: defaultFormat,
       isEditing: false,
       editedTxt: "",
       loading: true,
@@ -329,7 +364,7 @@ function App() {
         target,
         bundle,
         segments: parsedSegments,
-        selectedFormat: parsedSegments.length > 0 ? "sync" : "txt",
+        selectedFormat: defaultFormat === "ai" ? "ai" : parsedSegments.length > 0 ? "sync" : "txt",
         isEditing: false,
         editedTxt: bundle.txt,
         loading: false,
@@ -371,7 +406,6 @@ function App() {
         srt: finalSrt,
       });
 
-      // Recarregar bundle atualizado
       const updatedBundle = await invoke<TranscriptBundle>("read_transcript_bundle", {
         outputDir: viewing.target.output_dir,
       });
@@ -391,7 +425,6 @@ function App() {
           : v
       );
 
-      // Atualizar lista de histórico
       const updatedHistory = await invoke<HistoryEntry[]>("get_history");
       setHistory(updatedHistory);
 
@@ -595,7 +628,7 @@ function App() {
               <div className="file-picker">
                 <div>
                   <strong>ou selecione / arraste arquivos deste Mac</strong>
-                  <p>Vídeo ou áudio (MP4, MOV, MKV, MP3, M4A, WAV, etc.) — arrraste e solte direto aqui.</p>
+                  <p>Vídeo ou áudio (MP4, MOV, MKV, MP3, M4A, WAV, etc.) — arraste e solte direto aqui.</p>
                 </div>
                 <div className="picker-buttons">
                   <button
@@ -731,6 +764,22 @@ function App() {
                                 }
                               >
                                 🎙️ Player & Transcrição
+                              </button>
+                              <button
+                                className="small-button secondary"
+                                onClick={() =>
+                                  openViewer(
+                                    {
+                                      title: item.title || "Transcrição",
+                                      source: item.source,
+                                      source_kind: item.source_kind,
+                                      output_dir: item.output_dir,
+                                    },
+                                    "ai"
+                                  )
+                                }
+                              >
+                                ✨ Insights IA
                               </button>
                               <button
                                 className={`small-button secondary ${copiedId === item.id ? "success" : ""}`}
@@ -871,6 +920,22 @@ function App() {
                           🎙️ Player & Transcrição
                         </button>
                         <button
+                          className="small-button secondary"
+                          onClick={() =>
+                            openViewer(
+                              {
+                                title: item.title,
+                                source: item.source,
+                                source_kind: item.source_kind,
+                                output_dir: item.output_dir,
+                              },
+                              "ai"
+                            )
+                          }
+                        >
+                          ✨ Insights IA
+                        </button>
+                        <button
                           className={`small-button secondary ${copiedId === item.id ? "success" : ""}`}
                           onClick={() => copyTranscript(item.output_dir, item.id)}
                         >
@@ -888,7 +953,7 @@ function App() {
           </section>
         )}
 
-        {/* MODAL: VISUALIZADOR MULTI-FORMATO & PLAYER SINCRONIZADO */}
+        {/* MODAL: VISUALIZADOR MULTI-FORMATO, PLAYER SINCRONIZADO & IA */}
         {viewing && (
           <div className="backdrop" onClick={() => setViewing(null)}>
             <section className="modal card viewer-modal" onClick={(e) => e.stopPropagation()}>
@@ -900,20 +965,22 @@ function App() {
                   <h2>{viewing.target.title}</h2>
                 </div>
                 <div className="viewer-top-actions">
-                  <button
-                    type="button"
-                    className={`small-button ${viewing.isEditing ? "success" : "secondary"}`}
-                    onClick={() => setViewing({ ...viewing, isEditing: !viewing.isEditing })}
-                  >
-                    {viewing.isEditing ? "👁️ Visualizar" : "✏️ Editar texto"}
-                  </button>
+                  {viewing.selectedFormat !== "ai" && (
+                    <button
+                      type="button"
+                      className={`small-button ${viewing.isEditing ? "success" : "secondary"}`}
+                      onClick={() => setViewing({ ...viewing, isEditing: !viewing.isEditing })}
+                    >
+                      {viewing.isEditing ? "👁️ Visualizar" : "✏️ Editar texto"}
+                    </button>
+                  )}
                   <button className="icon" onClick={() => setViewing(null)}>
                     ×
                   </button>
                 </div>
               </div>
 
-              {viewing.loading && <div className="viewer-loading">Carregando transcrição e áudio...</div>}
+              {viewing.loading && <div className="viewer-loading">Carregando transcrição e recursos...</div>}
 
               {viewing.error && <div className="notice error">{viewing.error}</div>}
 
@@ -925,8 +992,14 @@ function App() {
 
               {!viewing.loading && !viewing.error && viewing.bundle && (
                 <>
-                  {/* Barra de Abas de Formatos & Player */}
+                  {/* Barra de Abas de Formatos, Player & IA */}
                   <div className="viewer-tabs-bar">
+                    <button
+                      className={`viewer-tab ai-tab ${viewing.selectedFormat === "ai" ? "active" : ""}`}
+                      onClick={() => setViewing({ ...viewing, selectedFormat: "ai", isEditing: false })}
+                    >
+                      ✨ Inteligência IA
+                    </button>
                     {viewing.segments.length > 0 && (
                       <button
                         className={`viewer-tab ${viewing.selectedFormat === "sync" ? "active" : ""}`}
@@ -985,7 +1058,14 @@ function App() {
                   </div>
 
                   {/* Conteúdo Principal da Aba */}
-                  {viewing.selectedFormat === "sync" ? (
+                  {viewing.selectedFormat === "ai" ? (
+                    <AiInsightsPanel
+                      outputDir={viewing.target.output_dir}
+                      title={viewing.target.title}
+                      prefs={prefs}
+                      onOpenSettings={() => setShowSettings(true)}
+                    />
+                  ) : viewing.selectedFormat === "sync" ? (
                     <AudioPlayerSync
                       outputDir={viewing.target.output_dir}
                       segments={viewing.segments}
@@ -1020,13 +1100,13 @@ function App() {
                       >
                         {viewing.savingEdits ? "Salvando..." : "💾 Salvar alterações"}
                       </button>
-                    ) : (
+                    ) : viewing.selectedFormat !== "ai" ? (
                       <button className={`primary ${viewerCopied ? "success" : ""}`} onClick={copyViewerCurrentText}>
                         {viewerCopied
                           ? `✓ Copiado (.${viewing.selectedFormat})!`
                           : `📋 Copiar .${viewing.selectedFormat.toUpperCase()}`}
                       </button>
-                    )}
+                    ) : null}
 
                     <button className="secondary" onClick={() => setViewing(null)}>
                       Fechar
@@ -1048,14 +1128,14 @@ function App() {
           }}
         />
 
-        {/* MODAL: CONFIGURAÇÕES & GERENCIADOR DE MODELOS */}
+        {/* MODAL: CONFIGURAÇÕES & GERENCIADOR DE MODELOS / IA */}
         {showSettings && prefs && (
           <div className="backdrop" onClick={() => setShowSettings(false)}>
             <section className="modal card settings-modal" onClick={(e) => e.stopPropagation()}>
               <div className="section-title">
                 <div>
-                  <h2>Configurações locais & Modelos</h2>
-                  <p className="muted">Gerencie os modelos Whisper GGML e executáveis no Mac.</p>
+                  <h2>Configurações locais & IA</h2>
+                  <p className="muted">Gerencie modelos Whisper, provedores de IA (Ollama/Nuvem) e executáveis.</p>
                 </div>
                 <button className="icon" onClick={() => setShowSettings(false)}>
                   ×
@@ -1063,6 +1143,281 @@ function App() {
               </div>
 
               <div className="settings-fields">
+                {/* CONFIGURAÇÃO DE IA / LLMS */}
+                <div className="ai-settings-section">
+                  <div className="models-header">
+                    <h3>🤖 Provedor de Inteligência Artificial (Pós-processamento)</h3>
+                    <p className="muted">Escolha entre Ollama local (100% privado) ou provedores em nuvem.</p>
+                  </div>
+
+                  <div className="provider-selector-row">
+                    {(["ollama", "gemini", "openai", "groq"] as AiProvider[]).map((prov) => {
+                      const labels: Record<AiProvider, string> = {
+                        ollama: "🟢 Ollama (Local)",
+                        gemini: "⚡ Google Gemini",
+                        openai: "⚡ OpenAI (GPT)",
+                        groq: "⚡ Groq (Ultra-rápido)",
+                      };
+                      return (
+                        <button
+                          key={prov}
+                          type="button"
+                          className={`provider-pill ${(prefs.ai?.provider || "ollama") === prov ? "active" : ""}`}
+                          onClick={() =>
+                            setPrefs({
+                              ...prefs,
+                              ai: { ...(prefs.ai || ({} as AiPreferences)), provider: prov },
+                            })
+                          }
+                        >
+                          {labels[prov]}
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  {/* Configurações específicas do Ollama */}
+                  {(prefs.ai?.provider || "ollama") === "ollama" && (
+                    <div className="provider-fields">
+                      <div className="field-group">
+                        <label htmlFor="ollama_endpoint">Endpoint do Ollama</label>
+                        <div className="input-with-button">
+                          <input
+                            id="ollama_endpoint"
+                            value={prefs.ai?.ollama_endpoint || "http://127.0.0.1:11434"}
+                            onChange={(e) =>
+                              setPrefs({
+                                ...prefs,
+                                ai: { ...(prefs.ai || ({} as AiPreferences)), ollama_endpoint: e.target.value },
+                              })
+                            }
+                            placeholder="http://127.0.0.1:11434"
+                          />
+                          <button
+                            type="button"
+                            className="secondary small-button"
+                            onClick={testOllamaConnection}
+                            disabled={checkingOllama}
+                          >
+                            {checkingOllama ? "Testando..." : "Testar conexão"}
+                          </button>
+                        </div>
+                        {ollamaStatusMsg && (
+                          <span
+                            className={`diag-feedback ${
+                              ollamaStatusMsg.startsWith("✓") ? "ok-text" : "warn-text"
+                            }`}
+                          >
+                            {ollamaStatusMsg}
+                          </span>
+                        )}
+                      </div>
+
+                      <div className="field-group">
+                        <label htmlFor="ollama_model">Modelo Ollama instalado</label>
+                        {ollamaModels.length > 0 ? (
+                          <select
+                            id="ollama_model"
+                            value={prefs.ai?.ollama_model || ollamaModels[0]}
+                            onChange={(e) =>
+                              setPrefs({
+                                ...prefs,
+                                ai: { ...(prefs.ai || ({} as AiPreferences)), ollama_model: e.target.value },
+                              })
+                            }
+                          >
+                            {ollamaModels.map((m) => (
+                              <option key={m} value={m}>
+                                {m}
+                              </option>
+                            ))}
+                          </select>
+                        ) : (
+                          <input
+                            id="ollama_model"
+                            value={prefs.ai?.ollama_model || "llama3.2:latest"}
+                            onChange={(e) =>
+                              setPrefs({
+                                ...prefs,
+                                ai: { ...(prefs.ai || ({} as AiPreferences)), ollama_model: e.target.value },
+                              })
+                            }
+                            placeholder="Ex: llama3.2:latest ou qwen2.5:latest"
+                          />
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Configurações Gemini */}
+                  {prefs.ai?.provider === "gemini" && (
+                    <div className="provider-fields">
+                      <div className="field-group">
+                        <label htmlFor="gemini_api_key">Chave de API do Google Gemini</label>
+                        <input
+                          id="gemini_api_key"
+                          type="password"
+                          value={prefs.ai?.gemini_api_key || ""}
+                          onChange={(e) =>
+                            setPrefs({
+                              ...prefs,
+                              ai: { ...(prefs.ai || ({} as AiPreferences)), gemini_api_key: e.target.value },
+                            })
+                          }
+                          placeholder="AIzaSy..."
+                        />
+                      </div>
+                      <div className="field-group">
+                        <label htmlFor="gemini_model">Modelo Gemini</label>
+                        <input
+                          id="gemini_model"
+                          list="gemini-models-datalist"
+                          value={
+                            prefs.ai?.gemini_model === "gemini-1.5-pro" || prefs.ai?.gemini_model === "gemini-2.5-pro"
+                              ? "gemini-3.1-pro-preview"
+                              : !prefs.ai?.gemini_model ||
+                                prefs.ai?.gemini_model === "gemini-1.5-flash" ||
+                                prefs.ai?.gemini_model === "gemini-2.0-flash" ||
+                                prefs.ai?.gemini_model === "gemini-2.5-flash"
+                              ? "gemini-3.7-flash"
+                              : prefs.ai.gemini_model
+                          }
+                          onChange={(e) =>
+                            setPrefs({
+                              ...prefs,
+                              ai: { ...(prefs.ai || ({} as AiPreferences)), gemini_model: e.target.value },
+                            })
+                          }
+                          placeholder="Ex: gemini-3.7-flash ou gemini-3.1-pro-preview"
+                        />
+                        <datalist id="gemini-models-datalist">
+                          <option value="gemini-3.7-flash">gemini-3.7-flash (Recomendado - Mais recente, Rápido & Inteligente)</option>
+                          <option value="gemini-3.1-pro-preview">gemini-3.1-pro-preview (Máximo Raciocínio & Contexto Longo)</option>
+                          <option value="gemini-2.5-flash">gemini-2.5-flash</option>
+                        </datalist>
+                        <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginTop: "4px" }}>
+                          {[
+                            { id: "gemini-3.7-flash", label: "⚡ gemini-3.7-flash (Padrão)" },
+                            { id: "gemini-3.1-pro-preview", label: "🧠 gemini-3.1-pro-preview" },
+                            { id: "gemini-2.5-flash", label: "🚀 gemini-2.5-flash" },
+                          ].map((m) => {
+                            const currentVal =
+                              prefs.ai?.gemini_model === "gemini-1.5-pro" || prefs.ai?.gemini_model === "gemini-2.5-pro"
+                                ? "gemini-3.1-pro-preview"
+                                : !prefs.ai?.gemini_model ||
+                                  prefs.ai?.gemini_model === "gemini-1.5-flash" ||
+                                  prefs.ai?.gemini_model === "gemini-2.0-flash" ||
+                                  prefs.ai?.gemini_model === "gemini-2.5-flash"
+                                ? "gemini-3.7-flash"
+                                : prefs.ai.gemini_model;
+                            const isSelected = currentVal === m.id;
+                            return (
+                              <button
+                                key={m.id}
+                                type="button"
+                                style={{
+                                  padding: "4px 10px",
+                                  fontSize: "11px",
+                                  fontWeight: 500,
+                                  borderRadius: "6px",
+                                  cursor: "pointer",
+                                  border: isSelected ? "1px solid #818cf8" : "1px solid #ffffff25",
+                                  background: isSelected ? "#4f46e540" : "#ffffff10",
+                                  color: isSelected ? "#a5b4fc" : "#cbd5e1",
+                                  transition: "all 0.15s ease",
+                                }}
+                                onClick={() =>
+                                  setPrefs({
+                                    ...prefs,
+                                    ai: { ...(prefs.ai || ({} as AiPreferences)), gemini_model: m.id },
+                                  })
+                                }
+                              >
+                                {m.label}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Configurações OpenAI */}
+                  {prefs.ai?.provider === "openai" && (
+                    <div className="provider-fields">
+                      <div className="field-group">
+                        <label htmlFor="openai_api_key">Chave de API OpenAI</label>
+                        <input
+                          id="openai_api_key"
+                          type="password"
+                          value={prefs.ai?.openai_api_key || ""}
+                          onChange={(e) =>
+                            setPrefs({
+                              ...prefs,
+                              ai: { ...(prefs.ai || ({} as AiPreferences)), openai_api_key: e.target.value },
+                            })
+                          }
+                          placeholder="sk-..."
+                        />
+                      </div>
+                      <div className="field-group">
+                        <label htmlFor="openai_model">Modelo OpenAI</label>
+                        <select
+                          id="openai_model"
+                          value={prefs.ai?.openai_model || "gpt-4o-mini"}
+                          onChange={(e) =>
+                            setPrefs({
+                              ...prefs,
+                              ai: { ...(prefs.ai || ({} as AiPreferences)), openai_model: e.target.value },
+                            })
+                          }
+                        >
+                          <option value="gpt-4o-mini">gpt-4o-mini (Recomendado)</option>
+                          <option value="gpt-4o">gpt-4o (Completo)</option>
+                        </select>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Configurações Groq */}
+                  {prefs.ai?.provider === "groq" && (
+                    <div className="provider-fields">
+                      <div className="field-group">
+                        <label htmlFor="groq_api_key">Chave de API Groq</label>
+                        <input
+                          id="groq_api_key"
+                          type="password"
+                          value={prefs.ai?.groq_api_key || ""}
+                          onChange={(e) =>
+                            setPrefs({
+                              ...prefs,
+                              ai: { ...(prefs.ai || ({} as AiPreferences)), groq_api_key: e.target.value },
+                            })
+                          }
+                          placeholder="gsk_..."
+                        />
+                      </div>
+                      <div className="field-group">
+                        <label htmlFor="groq_model">Modelo Groq</label>
+                        <select
+                          id="groq_model"
+                          value={prefs.ai?.groq_model || "llama-3.3-70b-versatile"}
+                          onChange={(e) =>
+                            setPrefs({
+                              ...prefs,
+                              ai: { ...(prefs.ai || ({} as AiPreferences)), groq_model: e.target.value },
+                            })
+                          }
+                        >
+                          <option value="llama-3.3-70b-versatile">llama-3.3-70b-versatile (Alta precisão)</option>
+                          <option value="mixtral-8x7b-32768">mixtral-8x7b-32768 (Contexto longo)</option>
+                          <option value="llama3-8b-8192">llama3-8b-8192 (Ultra veloz)</option>
+                        </select>
+                      </div>
+                    </div>
+                  )}
+                </div>
+
                 {/* GERENCIADOR DE MODELOS WHISPER */}
                 <div className="models-manager-section">
                   <div className="models-header">
