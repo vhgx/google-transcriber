@@ -2933,17 +2933,28 @@ mod tests {
     }
 
     #[test]
-    fn generates_markdown_transcript_correctly() {
-        let md = generate_markdown_transcript(
+    fn generates_markdown_transcript_with_and_without_srt() {
+        let md_with_srt = generate_markdown_transcript(
             "Vídeo de Teste",
             "https://youtu.be/test",
             "ggml-medium.bin",
             "Olá mundo, este é um teste.",
             Some("1\n00:00:00,000 --> 00:00:02,000\nOlá mundo"),
         );
-        assert!(md.contains("# Transcrição: Vídeo de Teste"));
-        assert!(md.contains("Olá mundo, este é um teste."));
-        assert!(md.contains("## ⏱️ Linha do Tempo (Timestamps)"));
+        assert!(md_with_srt.contains("# Transcrição: Vídeo de Teste"));
+        assert!(md_with_srt.contains("6 palavras · 27 caracteres"));
+        assert!(md_with_srt.contains("## ⏱️ Linha do Tempo (Timestamps)"));
+
+        let md_without_srt = generate_markdown_transcript(
+            "Vídeo Sem SRT",
+            "https://youtu.be/test2",
+            "ggml-tiny.bin",
+            "Apenas texto.",
+            None,
+        );
+        assert!(md_without_srt.contains("# Transcrição: Vídeo Sem SRT"));
+        assert!(md_without_srt.contains("2 palavras · 13 caracteres"));
+        assert!(!md_without_srt.contains("Linha do Tempo"));
     }
 
     #[test]
@@ -2958,6 +2969,123 @@ mod tests {
         let sample_note = "---\ntype: literature-note\n---\n\n# 📺 [[Arquitetura Hexagonal com Rust]]\n\n> [!SUMMARY]\n";
         let extracted_title = extract_title_from_note_or_dir(sample_note, "/path/to/2026-08-26");
         assert_eq!(extracted_title, "Arquitetura Hexagonal com Rust");
+
+        let fallback_title = extract_title_from_note_or_dir("Sem titulo", "/path/to/MeuLote");
+        assert_eq!(fallback_title, "MeuLote");
+    }
+
+    #[test]
+    fn test_preferences_persistence_roundtrip() {
+        let temp_config = std::env::temp_dir().join(format!("test-config-{}.json", Uuid::new_v4()));
+        let mut prefs = Preferences::default();
+        prefs.concurrency = 2;
+        prefs.obsidian_vault_path = "/Users/test/Vault".into();
+
+        persist_preferences(&temp_config, &prefs).unwrap();
+        let loaded = load_preferences(&temp_config);
+        assert_eq!(loaded.concurrency, 2);
+        assert_eq!(loaded.obsidian_vault_path, "/Users/test/Vault");
+
+        let _ = fs::remove_file(&temp_config);
+    }
+
+    #[test]
+    fn test_history_persistence_roundtrip() {
+        let temp_hist = std::env::temp_dir().join(format!("test-history-{}.json", Uuid::new_v4()));
+        
+        let initial = load_history(&temp_hist);
+        assert!(initial.is_empty());
+
+        let entry = HistoryEntry {
+            id: "id-123".into(),
+            batch_id: "batch-1".into(),
+            created_at: "2026-08-26T22:00:00Z".into(),
+            title: "Meu Vídeo".into(),
+            source: "https://youtu.be/123".into(),
+            source_kind: SourceKind::Youtube,
+            output_dir: "/downloads/123".into(),
+            status: ItemStatus::Concluido,
+            word_count: 10,
+            char_count: 50,
+            preview_text: "Texto de teste".into(),
+            model_name: "ggml-medium.bin".into(),
+            formats: vec!["txt".into(), "srt".into(), "md".into()],
+        };
+
+        persist_history(&temp_hist, &[entry.clone()]).unwrap();
+
+        let updated = load_history(&temp_hist);
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0].id, "id-123");
+        assert_eq!(updated[0].title, "Meu Vídeo");
+        assert_eq!(updated[0].word_count, 10);
+
+        let _ = fs::remove_file(&temp_hist);
+    }
+
+    #[test]
+    fn test_parse_web_url_all_variants() {
+        let (_, k1) = parse_web_url("https://www.youtube.com/shorts/abc123xyz").unwrap();
+        assert_eq!(k1, SourceKind::Youtube);
+
+        let (_, k2) = parse_web_url("https://music.youtube.com/watch?v=abc123xyz").unwrap();
+        assert_eq!(k2, SourceKind::Youtube);
+
+        let (_, k3) = parse_web_url("https://drive.google.com/uc?id=abc123xyz").unwrap();
+        assert_eq!(k3, SourceKind::Drive);
+    }
+
+    #[test]
+    fn test_local_source_formats() {
+        for ext in &["mp4", "MP4", "mov", "mkv", "webm", "avi", "m4v"] {
+            let p = std::env::temp_dir().join(format!("test-{}.{}", Uuid::new_v4(), ext));
+            fs::write(&p, b"v").unwrap();
+            let (_, kind) = local_source(p.to_str().unwrap()).unwrap();
+            assert_eq!(kind, SourceKind::VideoFile);
+            let _ = fs::remove_file(&p);
+        }
+
+        for ext in &["mp3", "WAV", "m4a", "aac", "flac", "ogg", "opus", "aiff"] {
+            let p = std::env::temp_dir().join(format!("test-{}.{}", Uuid::new_v4(), ext));
+            fs::write(&p, b"a").unwrap();
+            let (_, kind) = local_source(p.to_str().unwrap()).unwrap();
+            assert_eq!(kind, SourceKind::AudioFile);
+            let _ = fs::remove_file(&p);
+        }
+    }
+
+    #[test]
+    fn test_batch_and_types_serde() {
+        let item = BatchItem {
+            id: "i1".into(),
+            source: "https://youtu.be/123".into(),
+            source_kind: SourceKind::Youtube,
+            local_path: None,
+            title: Some("Titulo".into()),
+            status: ItemStatus::Aguardando,
+            progress: 0.0,
+            stage: None,
+            output_dir: "/downloads/item1".into(),
+            error: None,
+            log: vec!["Iniciado".into()],
+        };
+
+        let json = serde_json::to_string(&item).unwrap();
+        let deserialized: BatchItem = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.id, "i1");
+        assert_eq!(deserialized.status, ItemStatus::Aguardando);
+
+        let bundle = TranscriptBundle {
+            txt: "txt".into(),
+            srt: Some("srt".into()),
+            vtt: Some("vtt".into()),
+            json: None,
+            md: Some("md".into()),
+        };
+        let b_json = serde_json::to_string(&bundle).unwrap();
+        let b_deser: TranscriptBundle = serde_json::from_str(&b_json).unwrap();
+        assert_eq!(b_deser.txt, "txt");
+        assert_eq!(b_deser.srt.as_deref(), Some("srt"));
     }
 }
 

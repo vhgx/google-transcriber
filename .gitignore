@@ -1,6 +1,7 @@
 # Dependências e Builds
 node_modules/
 dist/
+coverage/
 target/
 src-tauri/target/
 src-server/target/
