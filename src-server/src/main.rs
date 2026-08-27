@@ -2455,17 +2455,17 @@ struct ObsidianExportResponse {
 }
 
 fn sanitize_filename(name: &str) -> String {
-    let invalid_chars = ['/', '\\', ':', '*', '?', '"', '<', '>', '|', '\n', '\r', '\t'];
+    let invalid_chars = ['/', '\\', ':', '*', '?', '"', '<', '>', '|', '\n', '\r', '\t', '[', ']', '#'];
     let sanitized: String = name
         .chars()
         .map(|c| if invalid_chars.contains(&c) { ' ' } else { c })
         .collect();
     let trimmed = sanitized.split_whitespace().collect::<Vec<_>>().join(" ");
-    let without_brackets = trimmed.trim_matches(|c| c == '[' || c == ']' || c == '#' || c == ' ');
-    if without_brackets.is_empty() {
+    let cleaned = trimmed.trim_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '-');
+    if cleaned.is_empty() {
         "Nota Transcricao".to_string()
     } else {
-        without_brackets.chars().take(80).collect()
+        cleaned.chars().take(80).collect()
     }
 }
 
@@ -2945,5 +2945,20 @@ mod tests {
         assert!(md.contains("Olá mundo, este é um teste."));
         assert!(md.contains("## ⏱️ Linha do Tempo (Timestamps)"));
     }
+
+    #[test]
+    fn test_obsidian_preferences_and_sanitization() {
+        let prefs = Preferences::default();
+        assert_eq!(prefs.obsidian_vault_path, "");
+        assert_eq!(prefs.obsidian_subfolder, "Transcrições");
+
+        let sanitized = sanitize_filename("Vídeo: Como Usar [[Rust]] & Docker? / Guia");
+        assert_eq!(sanitized, "Vídeo Como Usar Rust & Docker Guia");
+
+        let sample_note = "---\ntype: literature-note\n---\n\n# 📺 [[Arquitetura Hexagonal com Rust]]\n\n> [!SUMMARY]\n";
+        let extracted_title = extract_title_from_note_or_dir(sample_note, "/path/to/2026-08-26");
+        assert_eq!(extracted_title, "Arquitetura Hexagonal com Rust");
+    }
 }
+
 
