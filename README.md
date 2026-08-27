@@ -22,8 +22,10 @@ Cada lote cria uma pasta em `~/Downloads/Transcrições/<data-hora>/`, contendo 
     - 🎯 **Plano de Ação & Tarefas**: Decisões tomadas, lista de tarefas acionáveis e prazos citados.
     - 📑 **Capítulos do YouTube**: Minutagem precisa com timestamps (`00:00 Introdução...`) gerada a partir dos timestamps do Whisper.
     - 🧹 **Transcrição Limpa / Artigo**: Converte a fala espontânea em texto editorial polido sem hesitações ("humm", "tipo", repetições).
+    - 💎 **Nota Obsidian (Zettelkasten Didático)**: Gera nota completa com YAML Frontmatter, callouts (`> [!SUMMARY]`), `[[Wikilinks]]` interligados e flashcards (`Pergunta::Resposta`).
   - **💬 Pergunte ao Áudio (Chat Interativo)**: Converse diretamente com a transcrição para tirar dúvidas ou fazer perguntas livres sobre o conteúdo.
-  - **Exportação Automática**: Salvamento de relatórios em Markdown (`resumo.md`, `capitulos.md`, `tarefas.md`) na pasta do lote.
+  - **💎 Integração com Obsidian Vault**: Salve notas diretamente no seu cofre Obsidian com 1 clique e abra no app nativo via `obsidian://open`.
+  - **Exportação Automática**: Salvamento de relatórios em Markdown (`resumo.md`, `capitulos.md`, `tarefas.md`, `nota_obsidian.md`) na pasta do lote.
 - **Player de Áudio Sincronizado**: Reproduza o áudio local com sincronização em tempo real de timestamps do Whisper, destaque automático do trecho falado e navegação clicável (clique em qualquer linha para saltar o áudio).
 - **Editor de Transcrições Integrado**: Corrija termos e pontuações diretamente na interface com salvamento em disco (`.txt`, `.srt`, `.md`) e sincronização no histórico.
 - **Gerenciador de Modelos In-App**: Baixe e alterne com 1 clique modelos GGML oficiais do Hugging Face (`tiny`, `base`, `small`, `medium`, `large-v3-turbo`, `large-v3`) com progresso em tempo real e métricas de RAM/velocidade.

@@ -6,6 +6,7 @@ import type {
   Diagnostic,
   HistoryEntry,
   ModelDownloadProgress,
+  ObsidianExportResult,
   Preferences,
   TranscriptBundle,
   WhisperModelInfo,
@@ -400,7 +401,40 @@ export const api = {
     window.location.href = `${BASE_URL}/api/export-zip?output_dir=${encodeURIComponent(path)}`;
   },
 
-  // 10. Assinatura de Eventos em Tempo Real (Tauri Events ou SSE)
+  // 10. Integração com Obsidian
+  async exportToObsidian(
+    outputDir: string,
+    filename?: string,
+    content?: string
+  ): Promise<ObsidianExportResult> {
+    if (isTauri()) {
+      return invoke<ObsidianExportResult>("export_to_obsidian", {
+        outputDir,
+        filename,
+        content,
+      });
+    }
+    return fetchApi<ObsidianExportResult>("/obsidian/export", {
+      method: "POST",
+      body: JSON.stringify({
+        output_dir: outputDir,
+        filename: filename || null,
+        content: content || null,
+      }),
+    });
+  },
+
+  async openInObsidian(uriOrPath: string): Promise<void> {
+    if (isTauri()) {
+      return invoke("open_in_obsidian", { uriOrPath });
+    }
+    await fetchApi("/obsidian/open", {
+      method: "POST",
+      body: JSON.stringify({ uri_or_path: uriOrPath }),
+    });
+  },
+
+  // 11. Assinatura de Eventos em Tempo Real (Tauri Events ou SSE)
   subscribeEvents(
     onBatchState: (batch: Batch) => void,
     onModelProgress: (progress: ModelDownloadProgress) => void

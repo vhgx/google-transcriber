@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "../services/api";
-import type { AiTemplateId, ChatMessage, Preferences } from "../types";
+import type { AiTemplateId, ChatMessage, ObsidianExportResult, Preferences } from "../types";
 
 interface AiInsightsPanelProps {
   outputDir: string;
@@ -35,6 +35,12 @@ const TEMPLATES: { id: AiTemplateId; title: string; icon: string; desc: string }
     desc: "Converte fala espontânea em artigo fluído sem vícios de linguagem.",
   },
   {
+    id: "obsidian",
+    title: "Nota Obsidian",
+    icon: "💎",
+    desc: "Nota didática Zettelkasten com Frontmatter, [[Wikilinks]], callouts e flashcards.",
+  },
+  {
     id: "chat",
     title: "Pergunte ao Áudio",
     icon: "💬",
@@ -48,12 +54,17 @@ export function AiInsightsPanel({
   prefs,
   onOpenSettings,
 }: AiInsightsPanelProps) {
-  const [selectedTemplate, setSelectedTemplate] = useState<AiTemplateId>("summary");
+  const [selectedTemplate, setSelectedTemplate] = useState<AiTemplateId>("obsidian");
   const [customPrompt, setCustomPrompt] = useState("");
   const [insightContent, setInsightContent] = useState<string>("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+
+  // Obsidian Export State
+  const [exportingObsidian, setExportingObsidian] = useState(false);
+  const [obsidianResult, setObsidianResult] = useState<ObsidianExportResult | null>(null);
+  const [obsidianSuccessMsg, setObsidianSuccessMsg] = useState<string | null>(null);
 
   // Chat State
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
@@ -156,6 +167,43 @@ export function AiInsightsPanel({
     }
   };
 
+  const handleExportToObsidian = async () => {
+    if (!insightContent) return;
+    if (!prefs?.obsidian_vault_path) {
+      setError("Caminho do Obsidian Vault não configurado. Por favor, defina a pasta do seu cofre nas Configurações.");
+      return;
+    }
+
+    setExportingObsidian(true);
+    setError(null);
+    setObsidianSuccessMsg(null);
+
+    try {
+      const res = await api.exportToObsidian(
+        outputDir,
+        undefined,
+        insightContent
+      );
+      setObsidianResult(res);
+      setObsidianSuccessMsg(`Salvo com sucesso no Obsidian: ${res.vault_name}/${res.saved_path.split("/").pop()}`);
+      setTimeout(() => setObsidianSuccessMsg(null), 6000);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setExportingObsidian(false);
+    }
+  };
+
+  const handleOpenInObsidian = async () => {
+    const uri = obsidianResult?.obsidian_uri;
+    if (!uri) return;
+    try {
+      await api.openInObsidian(uri);
+    } catch (err) {
+      setError(String(err));
+    }
+  };
+
   return (
     <div className="ai-panel-container">
       {/* Topo do Painel de IA */}
@@ -165,8 +213,14 @@ export function AiInsightsPanel({
             <span className="provider-dot" />
             <b>Provedor IA:</b> {activeProvider.toUpperCase()} ({activeModelName})
           </span>
+          {prefs?.obsidian_vault_path && (
+            <span className="ai-provider-pill obsidian-vault-pill" title={`Cofre: ${prefs.obsidian_vault_path}`}>
+              <span>💎</span>
+              <b>Obsidian:</b> {prefs.obsidian_vault_path.split("/").filter(Boolean).pop()}
+            </span>
+          )}
           <button type="button" className="small-button secondary ai-settings-link" onClick={onOpenSettings}>
-            ⚙ Configurar IA
+            ⚙ Configurar IA & Vault
           </button>
         </div>
       </div>
@@ -178,13 +232,46 @@ export function AiInsightsPanel({
         </div>
       )}
 
+      {obsidianSuccessMsg && (
+        <div className="notice success obsidian-success-notice">
+          <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+            <span>💎</span>
+            <span>{obsidianSuccessMsg}</span>
+          </div>
+          {obsidianResult && (
+            <button
+              type="button"
+              className="small-button primary"
+              onClick={handleOpenInObsidian}
+              style={{ marginLeft: "12px", padding: "4px 10px", fontSize: "0.8rem", whiteSpace: "nowrap" }}
+            >
+              🚀 Abrir no Obsidian
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Dica para configurar Vault se o template Obsidian estiver selecionado */}
+      {selectedTemplate === "obsidian" && !prefs?.obsidian_vault_path && (
+        <div className="obsidian-info-banner">
+          <span className="obsidian-info-icon">💎</span>
+          <div className="obsidian-info-text">
+            <strong>Segundo Cérebro: Conecte seu Obsidian Vault</strong>
+            <p>Defina a pasta do seu cofre em Configurações para salvar e abrir notas didáticas automaticamente.</p>
+          </div>
+          <button type="button" className="small-button secondary" onClick={onOpenSettings}>
+            ⚙ Configurar Vault
+          </button>
+        </div>
+      )}
+
       {/* Grid de Templates */}
       <div className="ai-templates-grid">
         {TEMPLATES.map((tmpl) => (
           <button
             key={tmpl.id}
             type="button"
-            className={`ai-template-card ${selectedTemplate === tmpl.id ? "active-template" : ""}`}
+            className={`ai-template-card ${selectedTemplate === tmpl.id ? "active-template" : ""} ${tmpl.id === "obsidian" ? "obsidian-card-accent" : ""}`}
             onClick={() => {
               setSelectedTemplate(tmpl.id);
               setError(null);
@@ -268,7 +355,7 @@ export function AiInsightsPanel({
           <div className="generator-actions-row">
             <button
               type="button"
-              className="primary generate-btn"
+              className={`primary generate-btn ${selectedTemplate === "obsidian" ? "obsidian-generate-btn" : ""}`}
               onClick={handleGenerate}
               disabled={loading}
             >
@@ -281,6 +368,43 @@ export function AiInsightsPanel({
 
             {insightContent && (
               <div className="generator-right-actions">
+                {/* Botão Obsidian */}
+                {prefs?.obsidian_vault_path ? (
+                  <button
+                    type="button"
+                    className={`small-button obsidian-export-btn ${obsidianResult ? "obsidian-saved" : ""}`}
+                    onClick={handleExportToObsidian}
+                    disabled={exportingObsidian}
+                    title="Salvar esta nota diretamente na pasta do seu cofre Obsidian"
+                  >
+                    {exportingObsidian
+                      ? "⏳ Salvando..."
+                      : obsidianResult
+                      ? "💎 Atualizar no Obsidian"
+                      : "💎 Salvar no Obsidian"}
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    className="small-button secondary obsidian-setup-btn"
+                    onClick={onOpenSettings}
+                    title="Configure a pasta do seu cofre Obsidian"
+                  >
+                    💎 Configurar Obsidian
+                  </button>
+                )}
+
+                {obsidianResult && (
+                  <button
+                    type="button"
+                    className="small-button obsidian-open-btn"
+                    onClick={handleOpenInObsidian}
+                    title="Abrir a nota diretamente no app Obsidian"
+                  >
+                    🚀 Abrir no Obsidian
+                  </button>
+                )}
+
                 <button
                   type="button"
                   className={`small-button secondary ${copied ? "success" : ""}`}

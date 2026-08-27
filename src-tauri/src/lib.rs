@@ -47,6 +47,10 @@ impl Default for AiPreferences {
     }
 }
 
+fn default_obsidian_subfolder() -> String {
+    "Transcrições".into()
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Preferences {
     pub yt_dlp_path: String,
@@ -57,6 +61,10 @@ pub struct Preferences {
     pub concurrency: u8,
     #[serde(default)]
     pub ai: AiPreferences,
+    #[serde(default)]
+    pub obsidian_vault_path: String,
+    #[serde(default = "default_obsidian_subfolder")]
+    pub obsidian_subfolder: String,
 }
 
 impl Default for Preferences {
@@ -70,6 +78,8 @@ impl Default for Preferences {
             output_dir: home.join("Downloads/Transcrições").to_string_lossy().into(),
             concurrency: 1,
             ai: AiPreferences::default(),
+            obsidian_vault_path: "".into(),
+            obsidian_subfolder: "Transcrições".into(),
         }
     }
 }
@@ -782,6 +792,42 @@ async fn generate_ai_insight(
             ),
             "transcricao_limpa.md",
         ),
+        "obsidian" => {
+            let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+            (
+                "Você é um arquivista do conhecimento, pesquisador e especialista em Obsidian, Zettelkasten e Ciência da Aprendizagem Didática.".to_string(),
+                format!(
+                    "Transforme a transcrição a seguir em uma Nota Didática Completa para o Obsidian no formato Zettelkasten / Literature Note em Markdown.\n\n\
+                    A nota deve seguir rigorosamente a estrutura abaixo:\n\n\
+                    ---\n\
+                    type: literature-note/video\n\
+                    date: {today}\n\
+                    tags:\n\
+                      - transcricao\n\
+                      - aprendizado\n\
+                      - segundo-cerebro\n\
+                    aliases: []\n\
+                    status: processado\n\
+                    ---\n\n\
+                    # 📺 [[Título Didático e Preciso do Conteúdo]]\n\n\
+                    > [!SUMMARY] Síntese Didática (Método Feynman)\n\
+                    > Explicação concisa e clara da ideia central em 2 a 3 frases, facilitando a compreensão rápida.\n\n\
+                    ## 💡 Big Ideas & Lições Centrais\n\
+                    - 3 a 5 principais insights práticos e conclusões fundamentais extraídas da fala.\n\n\
+                    ## 🧠 Conceitos-Chave & Conexões (com [[Wikilinks]])\n\
+                    - Explique de forma didática os principais conceitos, termos técnicos ou metodologias abordadas.\n\
+                    - OBRIGATÓRIO: Use colchetes duplos `[[Nome do Conceito]]` nos termos e tópicos centrais para interligar ao Grafo do Obsidian.\n\n\
+                    ## ⏱️ Minutagem & Destaques Cronológicos\n\
+                    - Se houver legendas/timestamps abaixo, liste os momentos-chave em `00:00 Nome do Trecho`.\n\n\
+                    ## ❓ Perguntas para Fixação (Active Recall / Flashcards)\n\
+                    - 3 a 4 perguntas e respostas para memorização ativa no formato `Pergunta::Resposta`.\n\n\
+                    Legendas SRT:\n{}\n\n\
+                    Transcrição:\n{transcript_text}",
+                    if !srt_text.trim().is_empty() { &srt_text } else { "(Legendas com timestamps não disponíveis)" }
+                ),
+                "nota_obsidian.md",
+            )
+        }
         "custom" => {
             let prompt = custom_prompt.unwrap_or_else(|| "Analise e faça uma síntese da transcrição.".into());
             (
@@ -846,6 +892,7 @@ fn list_saved_insights(output_dir: String) -> Result<Vec<(String, String, String
         ("actions", "Plano de Ação & Tarefas", "tarefas.md"),
         ("chapters", "Capítulos do YouTube", "capitulos.md"),
         ("clean", "Transcrição Limpa", "transcricao_limpa.md"),
+        ("obsidian", "Nota Obsidian (Zettelkasten)", "nota_obsidian.md"),
         ("custom", "Análise Personalizada", "analise_personalizada.md"),
     ];
 
@@ -859,6 +906,163 @@ fn list_saved_insights(output_dir: String) -> Result<Vec<(String, String, String
     }
 
     Ok(insights)
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ObsidianExportResult {
+    pub saved_path: String,
+    pub vault_name: String,
+    pub obsidian_uri: String,
+}
+
+fn sanitize_filename(name: &str) -> String {
+    let invalid_chars = ['/', '\\', ':', '*', '?', '"', '<', '>', '|', '\n', '\r', '\t'];
+    let sanitized: String = name
+        .chars()
+        .map(|c| if invalid_chars.contains(&c) { ' ' } else { c })
+        .collect();
+    let trimmed = sanitized.split_whitespace().collect::<Vec<_>>().join(" ");
+    let without_brackets = trimmed.trim_matches(|c| c == '[' || c == ']' || c == '#' || c == ' ');
+    if without_brackets.is_empty() {
+        "Nota Transcricao".to_string()
+    } else {
+        without_brackets.chars().take(80).collect()
+    }
+}
+
+fn extract_title_from_note_or_dir(content: &str, output_dir: &str) -> String {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("# ") {
+            let title = trimmed.trim_start_matches('#').trim();
+            let cleaned = title
+                .trim_start_matches(|c: char| !c.is_alphanumeric() && c != '[')
+                .trim_matches(|c: char| c == '[' || c == ']' || c == ' ');
+            if !cleaned.is_empty() {
+                return cleaned.to_string();
+            }
+        }
+    }
+
+    Path::new(output_dir)
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_else(|| "Nota Transcricao".to_string())
+}
+
+#[tauri::command]
+fn export_to_obsidian(
+    output_dir: String,
+    filename: Option<String>,
+    content: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<ObsidianExportResult, String> {
+    let prefs = lock(&state.preferences)?.clone();
+    let vault_path_str = prefs.obsidian_vault_path.trim();
+    if vault_path_str.is_empty() {
+        return Err("Caminho do Obsidian Vault não configurado. Por favor, configure nas preferências do aplicativo.".into());
+    }
+
+    let vault_path = PathBuf::from(vault_path_str);
+    if !vault_path.is_dir() {
+        return Err(format!("A pasta do Obsidian Vault não existe ou não é acessível: {vault_path_str}"));
+    }
+
+    let vault_name = vault_path
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_else(|| "Obsidian".to_string());
+
+    let md_content = if let Some(c) = content {
+        if !c.trim().is_empty() {
+            c
+        } else {
+            let note_path = PathBuf::from(&output_dir).join("nota_obsidian.md");
+            if note_path.is_file() {
+                fs::read_to_string(&note_path).map_err(|e| format!("Erro ao ler nota_obsidian.md: {e}"))?
+            } else {
+                return Err("Nenhum conteúdo fornecido e nota_obsidian.md não foi encontrada neste lote.".into());
+            }
+        }
+    } else {
+        let note_path = PathBuf::from(&output_dir).join("nota_obsidian.md");
+        if note_path.is_file() {
+            fs::read_to_string(&note_path).map_err(|e| format!("Erro ao ler nota_obsidian.md: {e}"))?
+        } else {
+            return Err("A Nota do Obsidian ainda não foi gerada para este lote. Clique em 'Gerar Nota Obsidian' primeiro.".into());
+        }
+    };
+
+    let subfolder_name = if prefs.obsidian_subfolder.trim().is_empty() {
+        "Transcrições".to_string()
+    } else {
+        prefs.obsidian_subfolder.trim().to_string()
+    };
+
+    let target_dir = vault_path.join(&subfolder_name);
+    if let Err(e) = fs::create_dir_all(&target_dir) {
+        return Err(format!("Falha ao criar subpasta no cofre '{subfolder_name}': {e}"));
+    }
+
+    let base_filename = if let Some(f) = filename {
+        if !f.trim().is_empty() {
+            f
+        } else {
+            extract_title_from_note_or_dir(&md_content, &output_dir)
+        }
+    } else {
+        extract_title_from_note_or_dir(&md_content, &output_dir)
+    };
+
+    let sanitized_filename = sanitize_filename(&base_filename);
+    let final_filename = if sanitized_filename.ends_with(".md") {
+        sanitized_filename
+    } else {
+        format!("{sanitized_filename}.md")
+    };
+
+    let target_file_path = target_dir.join(&final_filename);
+    if let Err(e) = fs::write(&target_file_path, &md_content) {
+        return Err(format!("Erro ao gravar nota no cofre: {e}"));
+    }
+
+    let relative_path_no_ext = if subfolder_name.is_empty() {
+        final_filename.trim_end_matches(".md").to_string()
+    } else {
+        format!("{}/{}", subfolder_name, final_filename.trim_end_matches(".md"))
+    };
+
+    let mut u = url::Url::parse("obsidian://open").unwrap_or_else(|_| url::Url::parse("obsidian://open").unwrap());
+    u.query_pairs_mut()
+        .append_pair("vault", &vault_name)
+        .append_pair("file", &relative_path_no_ext);
+
+    let obsidian_uri = u.to_string();
+
+    Ok(ObsidianExportResult {
+        saved_path: target_file_path.to_string_lossy().to_string(),
+        vault_name,
+        obsidian_uri,
+    })
+}
+
+#[tauri::command]
+fn open_in_obsidian(uri_or_path: String) -> Result<(), String> {
+    let uri = uri_or_path.trim();
+    if uri.is_empty() {
+        return Err("URI ou caminho do Obsidian está vazio.".into());
+    }
+
+    let status = std::process::Command::new("open")
+        .arg(uri)
+        .status()
+        .map_err(|e| format!("Erro ao executar comando open: {e}"))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("Falha ao abrir no Obsidian (código: {:?})", status.code()))
+    }
 }
 
 // -------------------------------------------------------------
@@ -2169,7 +2373,9 @@ pub fn run() {
             get_history,
             delete_history_item,
             clear_history,
-            open_in_finder
+            open_in_finder,
+            export_to_obsidian,
+            open_in_obsidian
         ])
         .run(tauri::generate_context!())
         .expect("erro ao executar aplicativo Tauri");

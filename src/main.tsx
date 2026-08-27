@@ -328,9 +328,12 @@ function App() {
     }
   }
 
-  async function browseDirectory(field: "output_dir", title: string) {
+  async function browseDirectory(
+    field: "output_dir" | "obsidian_vault_path",
+    title: string
+  ) {
     try {
-      const current = prefs ? (prefs[field] as string) : "";
+      const current = prefs ? (prefs[field] as string) || "" : "";
       const selected = await api.browseDirectory(title, current);
       if (selected) {
         setPrefs((p) => (p ? { ...p, [field]: selected } : p));
@@ -1410,6 +1413,60 @@ function App() {
                       </div>
                     </div>
                   )}
+                </div>
+
+                {/* INTEGRAÇÃO COM OBSIDIAN VAULT */}
+                <div className="obsidian-settings-section">
+                  <div className="models-header">
+                    <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                      <span style={{ fontSize: "1.3rem" }}>💎</span>
+                      <div>
+                        <h3>Integração com Obsidian (Segundo Cérebro)</h3>
+                        <p className="muted">
+                          Configure seu cofre (Vault) para exportar notas Zettelkasten didáticas diretamente para o Obsidian.
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="field-group">
+                    <div className="field-header">
+                      <label htmlFor="obsidian_vault_path">Pasta do Obsidian Vault</label>
+                      {prefs.obsidian_vault_path ? (
+                        <span className="diag-badge ok">✓ Configurado</span>
+                      ) : (
+                        <span className="diag-badge optional">Opcional</span>
+                      )}
+                    </div>
+                    <div className="input-with-button">
+                      <input
+                        id="obsidian_vault_path"
+                        value={prefs.obsidian_vault_path || ""}
+                        onChange={(e) => setPrefs({ ...prefs, obsidian_vault_path: e.target.value })}
+                        placeholder="Ex: /Users/seu-usuario/Documents/MeuCofre"
+                      />
+                      <button
+                        type="button"
+                        className="secondary small-button"
+                        onClick={() => browseDirectory("obsidian_vault_path", "Selecionar pasta do Obsidian Vault")}
+                      >
+                        Selecionar Vault...
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="field-group">
+                    <label htmlFor="obsidian_subfolder">Subpasta de destino no cofre</label>
+                    <input
+                      id="obsidian_subfolder"
+                      value={prefs.obsidian_subfolder || "Transcrições"}
+                      onChange={(e) => setPrefs({ ...prefs, obsidian_subfolder: e.target.value })}
+                      placeholder="Ex: Transcrições, Inbox ou Sources"
+                    />
+                    <span className="field-hint" style={{ fontSize: "0.8rem", color: "var(--muted)", marginTop: "4px", display: "block" }}>
+                      As notas didáticas serão salvas automaticamente nesta pasta dentro do seu cofre.
+                    </span>
+                  </div>
                 </div>
 
                 {/* GERENCIADOR DE MODELOS WHISPER */}

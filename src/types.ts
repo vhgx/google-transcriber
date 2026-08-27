@@ -18,7 +18,7 @@ export type TranscriptFormat = "sync" | "txt" | "srt" | "vtt" | "md" | "json" | 
 
 export type AiProvider = "ollama" | "gemini" | "openai" | "groq";
 
-export type AiTemplateId = "summary" | "actions" | "chapters" | "clean" | "chat";
+export type AiTemplateId = "summary" | "actions" | "chapters" | "clean" | "obsidian" | "chat";
 
 export interface AiPreferences {
   provider: AiProvider;
@@ -40,6 +40,8 @@ export interface Preferences {
   output_dir: string;
   concurrency: number;
   ai?: AiPreferences;
+  obsidian_vault_path?: string;
+  obsidian_subfolder?: string;
 }
 
 export interface Check {
@@ -143,4 +145,10 @@ export interface SavedInsight {
   title: string;
   content: string;
   filename: string;
+}
+
+export interface ObsidianExportResult {
+  saved_path: string;
+  vault_name: string;
+  obsidian_uri: string;
 }
