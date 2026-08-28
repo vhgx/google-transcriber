@@ -1315,12 +1315,13 @@ function App() {
                                 style={{
                                   padding: "4px 10px",
                                   fontSize: "11px",
-                                  fontWeight: 500,
-                                  borderRadius: "6px",
+                                  fontWeight: 600,
+                                  borderRadius: "7px",
                                   cursor: "pointer",
-                                  border: isSelected ? "1px solid #818cf8" : "1px solid #ffffff25",
-                                  background: isSelected ? "#4f46e540" : "#ffffff10",
-                                  color: isSelected ? "#a5b4fc" : "#cbd5e1",
+                                  border: isSelected ? "1px solid #4f46e5" : "1px solid rgba(203, 213, 225, 0.8)",
+                                  background: isSelected ? "rgba(238, 242, 255, 0.95)" : "rgba(241, 245, 249, 0.85)",
+                                  color: isSelected ? "#4338ca" : "#475569",
+                                  boxShadow: isSelected ? "0 1px 3px rgba(79, 70, 229, 0.12)" : "none",
                                   transition: "all 0.15s ease",
                                 }}
                                 onClick={() =>

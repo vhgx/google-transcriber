@@ -87,9 +87,9 @@ export function AudioRecorderModal({
         const barHeight = heightFactor * (canvas.height * 0.75);
 
         const gradient = ctx.createLinearGradient(0, canvas.height, 0, 0);
-        gradient.addColorStop(0, "rgba(16, 185, 129, 0.2)");
-        gradient.addColorStop(0.5, "rgba(43, 201, 173, 0.8)");
-        gradient.addColorStop(1, "rgba(94, 234, 212, 1)");
+        gradient.addColorStop(0, "rgba(79, 70, 229, 0.25)");
+        gradient.addColorStop(0.5, "rgba(99, 102, 241, 0.8)");
+        gradient.addColorStop(1, "rgba(6, 182, 212, 0.95)");
 
         ctx.fillStyle = gradient;
         ctx.fillRect(i * barWidth + 2, (canvas.height - barHeight) / 2, barWidth - 4, barHeight);
@@ -126,9 +126,9 @@ export function AudioRecorderModal({
         const barHeight = (dataArray[i] / 255) * (canvas.height * 0.85);
 
         const gradient = ctx.createLinearGradient(0, canvas.height, 0, 0);
-        gradient.addColorStop(0, "rgba(16, 185, 129, 0.2)");
-        gradient.addColorStop(0.5, "rgba(43, 201, 173, 0.8)");
-        gradient.addColorStop(1, "rgba(94, 234, 212, 1)");
+        gradient.addColorStop(0, "rgba(79, 70, 229, 0.25)");
+        gradient.addColorStop(0.5, "rgba(99, 102, 241, 0.8)");
+        gradient.addColorStop(1, "rgba(6, 182, 212, 0.95)");
 
         ctx.fillStyle = gradient;
         ctx.fillRect(x, (canvas.height - barHeight) / 2, barWidth - 1, barHeight);
